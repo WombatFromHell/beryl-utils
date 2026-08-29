@@ -1,0 +1,11 @@
+[Unit]
+Description=Conditional MangoHUD framelimiter (only under Wayland compositors)
+PartOf=wayland-session@niri.desktop.target wayland-session@hyprland.desktop.target
+After=wayland-session@niri.desktop.target wayland-session@hyprland.desktop.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/uwsm-mangohud.sh
+
+[Install]
+WantedBy=wayland-session@niri.desktop.target wayland-session@hyprland.desktop.target

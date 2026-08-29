@@ -1,0 +1,27 @@
+[Unit]
+Description=VRR/Fullscreen Monitor Events Watcher for Wayland
+# graphical-session.target is compositor-agnostic and is pulled in by
+# whichever wayland-session@<compositor>.desktop.target uwsm activates,
+# so this unit no longer hardcodes niri.
+PartOf=wayland-session@niri.desktop.target wayland-session@hyprland.desktop.target
+After=wayland-session@niri.desktop.target wayland-session@hyprland.desktop.target
+
+[Service]
+Type=simple
+# HYPRLAND_INSTANCE_SIGNATURE is required for hyprctl to find its socket
+# under $XDG_RUNTIME_DIR/hypr/. Importing it is a no-op under niri (unset)
+# and normally a no-op under uwsm too (uwsm already propagates it into the
+# systemd --user environment), but it's a defensive one-liner against any
+# session manager that doesn't.
+ExecStartPre=/usr/bin/systemctl --user import-environment WAYLAND_DISPLAY HYPRLAND_INSTANCE_SIGNATURE
+ExecStart=/usr/local/bin/wl-watcher
+Restart=on-failure
+RestartSec=5
+KillMode=control-group
+TimeoutStopSec=5
+ExecStop=/usr/bin/pkill -TERM -f "gamemode" || true
+Environment=WATCHER_HOOK_ON="%h/.local/bin/gamemode on"
+Environment=WATCHER_HOOK_OFF="%h/.local/bin/gamemode off"
+
+[Install]
+WantedBy=wayland-session@niri.desktop.target wayland-session@hyprland.desktop.target

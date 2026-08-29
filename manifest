@@ -1,0 +1,18 @@
+# src|role|outname|install_links|home_dest
+# Single source of truth shared with flake.nix (ponytail: both parse this file).
+#   role: bin lib pybin unit desktop
+#   outname: name on PATH / in store (or unit/desktop filename)
+#   install_links: %localbin%/x,%globalbin%/x  (empty = copy only; install.sh only)
+#   home_dest: HOME-relative dir for role=desktop symlink target
+beryl-steam.sh|bin|beryl-steam|%localbin%/beryl-steam,%globalbin%/beryl-steam
+chromium-flags.sh|bin|chromium-flags|%localbin%/chromium-flags,%globalbin%/chromium-flags
+chromium-wrapper.sh|bin|chromium-wrapper|%localbin%/chromium-wrapper,%globalbin%/chromium-wrapper
+gpu-detect.sh|lib|gpu-detect.sh||
+on_idle.sh|bin|on_idle|%localbin%/on_idle
+pactl_gate_sentinel.sh|bin|audio-gate-sentinel|%localbin%/audio-gate-sentinel,%globalbin%/audio-gate-sentinel
+uwsm-mangohud.sh|bin|uwsm-mangohud|%localbin%/uwsm-mangohud
+wl_watcher.py|pybin|wl-watcher|%localbin%/wl-watcher,%globalbin%/wl-watcher
+open-term-here.sh|bin|open-term-here.sh|%localbin%/open-term-here.sh
+opentermhere.desktop|desktop|opentermhere.desktop||.local/share/kio/servicemenus
+mangohud-uwsm.service|unit|mangohud-uwsm.service||
+wl-watcher-uwsm.service|unit|wl-watcher-uwsm.service||

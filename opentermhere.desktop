@@ -1,0 +1,27 @@
+[Desktop Entry]
+Type=Service
+Name=Open Term Here
+ServiceTypes=KonqPopupMenu
+MimeType=inode/directory;
+Actions=openTermHere;openTermHereWindow;openTermHereTmux;openTermHereZellij;
+TryExec=open-term-here.sh
+
+[Desktop Action openTermHere]
+Name=Open Term Here
+Icon=utilities-terminal
+Exec=open-term-here.sh %f
+
+[Desktop Action openTermHereWindow]
+Name=Open Term Here (window)
+Icon=utilities-terminal
+Exec=open-term-here.sh --term -- %f
+
+[Desktop Action openTermHereTmux]
+Name=Open Term Here (tmux)
+Icon=utilities-terminal
+Exec=open-term-here.sh --tmux -- %f
+
+[Desktop Action openTermHereZellij]
+Name=Open Term Here (zellij)
+Icon=utilities-terminal
+Exec=open-term-here.sh --zellij -- %f
