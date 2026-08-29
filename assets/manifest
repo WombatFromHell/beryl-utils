@@ -8,6 +8,7 @@
 scripts/beryl-steam.sh|bin|beryl-steam|%localbin%/beryl-steam,%globalbin%/beryl-steam
 scripts/chromium-flags.sh|bin|chromium-flags|%localbin%/chromium-flags,%globalbin%/chromium-flags
 scripts/chromium-wrapper.sh|bin|chromium-wrapper|%localbin%/chromium-wrapper,%globalbin%/chromium-wrapper
+scripts/spawn-browser.sh|bin|spawn-browser|%localbin%/spawn-browser,%globalbin%/spawn-browser
 scripts/gpu-detect.sh|lib|gpu-detect.sh||
 scripts/on_idle.sh|bin|on_idle|%localbin%/on_idle
 scripts/pactl_gate_sentinel.sh|bin|audio-gate-sentinel|%localbin%/audio-gate-sentinel,%globalbin%/audio-gate-sentinel

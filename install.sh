@@ -29,18 +29,18 @@ dispatch() {
   case "$role" in
   unit)
     check_dir "$UNIT_DIR"
-    cp -fp -- "$file" "$UNIT_DIR/$dest"
+    cp -vfp -- "$file" "$UNIT_DIR/$dest"
     units+=("$dest")
     ;;
   desktop)
     check_dir "$PREFERRED_LINK_TARGET"
-    cp -fp -- "$file" "$PREFERRED_LINK_TARGET/$dest"
+    cp -vfp -- "$file" "$PREFERRED_LINK_TARGET/$dest"
     check_dir "$HOME/$home"
     ln -sf "$PREFERRED_LINK_TARGET/$dest" "$HOME/$home/$out"
     ;;
   *)
     check_dir "$PREFERRED_LINK_TARGET"
-    cp -fp -- "$file" "$PREFERRED_LINK_TARGET/$dest"
+    cp -vfp -- "$file" "$PREFERRED_LINK_TARGET/$dest"
     [[ -z $links ]] && return
     check_dir "$LOCAL_LINK_TARGET"
     local IFS=',' link
