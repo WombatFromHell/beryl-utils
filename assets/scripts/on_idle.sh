@@ -14,7 +14,7 @@ set -euo pipefail
 # Output<->GPU association comes from gpu-detect.sh's sysfs map.
 
 scripts_dir="$(cd "${BASH_SOURCE[0]%/*}" && pwd)"
-# shellcheck source=./gpu-detect.sh
+# shellcheck source=./gpu-detect.sh disable=SC1091
 source "$scripts_dir/gpu-detect.sh"
 
 STATE="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/on_idle_off.lst"

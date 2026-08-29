@@ -16,14 +16,16 @@
 
     # ponytail: manifest is the single source of truth, shared with install.sh.
     # columns: src|role|outname|install_links|home_dest
+    # src is relative to assets/; name is the basename (unit names, store keys).
     manifestRows = let
-      raw = lib.splitString "\n" (builtins.readFile ./manifest);
+      raw = lib.splitString "\n" (builtins.readFile ./assets/manifest);
       keep = lib.filter (l: l != "" && !lib.hasPrefix "#" l) raw;
     in
       map (l: let
         p = lib.splitString "|" l;
       in {
         src = builtins.elemAt p 0;
+        name = baseNameOf (builtins.elemAt p 0);
         role = builtins.elemAt p 1;
         out = builtins.elemAt p 2;
         links = builtins.elemAt p 3;
@@ -55,18 +57,18 @@
               m:
                 if m.role == "bin"
                 then ''
-                  cp ${m.src} "$out/bin/${m.src}"
-                  ${lib.optionalString (m.src != m.out) ''
-                    ln -s "${m.src}" "$out/bin/${m.out}"
+                  cp assets/${m.src} "$out/bin/${m.name}"
+                  ${lib.optionalString (m.name != m.out) ''
+                    ln -s "${m.name}" "$out/bin/${m.out}"
                   ''}
                 ''
                 else if m.role == "lib"
                 then ''
-                  cp ${m.src} "$out/bin/${m.out}"
+                  cp assets/${m.src} "$out/bin/${m.out}"
                 ''
                 else if m.role == "pybin"
                 then ''
-                  cp ${m.src} "$out/lib/beryl-utils/${m.out}"
+                  cp assets/${m.src} "$out/lib/beryl-utils/${m.out}"
                   # ponytail: echo (not a heredoc) keeps the wrapper robust inside the
                   # generated installPhase; ${pkgs.python3} is resolved at eval time.
                   echo '#!/bin/sh' > "$out/bin/${m.out}"
@@ -106,7 +108,7 @@
 
     unitsFor = pkg:
       builtins.listToAttrs (
-        map (m: lib.nameValuePair m.src (patchUnit pkg ./${m.src})) unitRows
+        map (m: lib.nameValuePair m.name (patchUnit pkg ./assets/${m.src})) unitRows
       );
 
     homeModule = {
@@ -132,9 +134,9 @@
 
         systemd.user.services = builtins.listToAttrs (
           map (m:
-            lib.nameValuePair (lib.removeSuffix ".service" m.src) {
+            lib.nameValuePair (lib.removeSuffix ".service" m.name) {
               enable = true;
-              text = units.${m.src};
+              text = units.${m.name};
             })
           unitRows
         );
@@ -143,7 +145,7 @@
         # the store package derivation can't own $HOME paths, but the
         # home-manager module can.
         home.file = builtins.listToAttrs (
-          map (m: lib.nameValuePair "${m.home}/${m.out}" {source = ./${m.src};})
+          map (m: lib.nameValuePair "${m.home}/${m.out}" {source = ./assets/${m.src};})
           desktopRows
         );
       };
@@ -181,21 +183,21 @@
         environment.etc = lib.mkMerge [
           (builtins.listToAttrs (
             map (m:
-              lib.nameValuePair "systemd/user/${m.src}" {
-                text = units.${m.src};
+              lib.nameValuePair "systemd/user/${m.name}" {
+                text = units.${m.name};
               })
             unitRows
           ))
           {
             "systemd/user-preset/beryl-utils.preset".text =
-              lib.concatMapStringsSep "\n" (m: "enable ${m.src}") unitRows;
+              lib.concatMapStringsSep "\n" (m: "enable ${m.name}") unitRows;
           }
         ];
 
         system.activationScripts.beryl-utils-enable = ''
           ${pkgs.systemd}/bin/systemctl --global daemon-reload 2>/dev/null || true
           ${pkgs.systemd}/bin/systemctl --global preset ${
-            lib.concatMapStringsSep " " (m: m.src) unitRows
+            lib.concatMapStringsSep " " (m: m.name) unitRows
           } 2>/dev/null || true
         '';
 
@@ -208,7 +210,7 @@
               home.file = builtins.listToAttrs (
                 map (m:
                   lib.nameValuePair "${m.home}/${m.out}" {
-                    source = ./${m.src};
+                    source = ./assets/${m.src};
                   })
                 desktopRows
               );
@@ -231,8 +233,8 @@
           pkgs.bats
           pkgs.shfmt
           pkgs.shellcheck
-          (pkgs.writeShellScriptBin "localfmt" "exec shfmt -w -s -i 2 ./*.sh ./*.bats")
-          (pkgs.writeShellScriptBin "locallint" "exec shellcheck ./*.sh ./*.bats")
+          (pkgs.writeShellScriptBin "localfmt" "exec shfmt -w -s -i 2 assets/scripts/*.sh assets/scripts/*.bats")
+          (pkgs.writeShellScriptBin "locallint" "exec shellcheck assets/scripts/*.sh assets/scripts/*.bats")
           (pkgs.writeShellScriptBin "localbuild" "exec nix build .#default")
         ];
       };

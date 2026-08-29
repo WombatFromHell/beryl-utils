@@ -31,7 +31,7 @@ readonly PROFILE_DIR="${PROFILE_DIR:-$HOME/.config/chromium-wrapper}"
 readonly CONTAINER_ENV_FILE="${CONTAINER_ENV_FILE:-/run/.containerenv}"
 
 # GPU detection (DRM_SYS_PATH + detect_hybrid_graphics) lives in gpu-detect.sh.
-# shellcheck source=./gpu-detect.sh
+# shellcheck source=./gpu-detect.sh disable=SC1091
 source "$scripts_dir/gpu-detect.sh"
 
 # Effective config. Defaults are legacy-safe; a profile (sourced) and the

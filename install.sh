@@ -2,6 +2,7 @@
 set -euo pipefail
 
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ASSETS_DIR="$SRC_DIR/assets"
 PREFERRED_LINK_TARGET="$HOME/.local/bin/scripts"
 LOCAL_LINK_TARGET="$HOME/.local/bin"
 GLOBAL_LINK_TARGET="/usr/local/bin"
@@ -23,21 +24,23 @@ check_dir() {
 
 dispatch() {
   local src="$1" role="$2" out="$3" links="$4" home="$5"
+  # src is relative to assets/; the install dest is always the basename
+  local file="$ASSETS_DIR/$src" dest="${src##*/}"
   case "$role" in
   unit)
     check_dir "$UNIT_DIR"
-    cp -fp -- "$SRC_DIR/$src" "$UNIT_DIR/$src"
-    units+=("$src")
+    cp -fp -- "$file" "$UNIT_DIR/$dest"
+    units+=("$dest")
     ;;
   desktop)
     check_dir "$PREFERRED_LINK_TARGET"
-    cp -fp -- "$SRC_DIR/$src" "$PREFERRED_LINK_TARGET/$src"
+    cp -fp -- "$file" "$PREFERRED_LINK_TARGET/$dest"
     check_dir "$HOME/$home"
-    ln -sf "$PREFERRED_LINK_TARGET/$src" "$HOME/$home/$out"
+    ln -sf "$PREFERRED_LINK_TARGET/$dest" "$HOME/$home/$out"
     ;;
   *)
     check_dir "$PREFERRED_LINK_TARGET"
-    cp -fp -- "$SRC_DIR/$src" "$PREFERRED_LINK_TARGET/$src"
+    cp -fp -- "$file" "$PREFERRED_LINK_TARGET/$dest"
     [[ -z $links ]] && return
     check_dir "$LOCAL_LINK_TARGET"
     local IFS=',' link
@@ -47,9 +50,9 @@ dispatch() {
       # ponytail: only the parent dir writability is checked; sudo is used for
       # root-owned dirs like /usr/local/bin. No password caching/retry logic.
       if [[ -w ${link%/*} ]]; then
-        ln -sf "$PREFERRED_LINK_TARGET/$src" "$link"
+        ln -sf "$PREFERRED_LINK_TARGET/$dest" "$link"
       else
-        sudo ln -sf "$PREFERRED_LINK_TARGET/$src" "$link"
+        sudo ln -sf "$PREFERRED_LINK_TARGET/$dest" "$link"
       fi
     done
     ;;
@@ -59,7 +62,7 @@ dispatch() {
 while IFS='|' read -r src role out links home; do
   [[ -z $src || $src == \#* ]] && continue
   dispatch "$src" "$role" "$out" "$links" "$home"
-done <"$SRC_DIR/manifest"
+done <"$ASSETS_DIR/manifest"
 
 if ((${#units[@]})); then
   systemctl --user daemon-reload
