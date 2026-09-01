@@ -7,8 +7,8 @@ Before=wayland-session@niri.desktop.target wayland-session@hyprland.desktop.targ
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=%h/.local/bin/uwsm-mangohud.sh start
-ExecStop=%h/.local/bin/uwsm-mangohud.sh stop
+ExecStart=%h/.local/bin/uwsm-mangohud start
+ExecStop=%h/.local/bin/uwsm-mangohud stop
 
 [Install]
 WantedBy=wayland-session-pre@niri.desktop.target wayland-session-pre@hyprland.desktop.target
