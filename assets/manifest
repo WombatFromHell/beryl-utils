@@ -17,4 +17,5 @@ scripts/chromium-flags.sh|bin|chromium-flags|%localbin%/chromium-flags,%globalbi
 scripts/chromium-wrapper.sh|bin|chromium-wrapper|%localbin%/chromium-wrapper,%globalbin%/chromium-wrapper
 scripts/spawn-browser.sh|bin|spawn-browser|%localbin%/spawn-browser,%globalbin%/spawn-browser
 scripts/pactl_gate_sentinel.sh|bin|audio-gate-sentinel|%localbin%/audio-gate-sentinel,%globalbin%/audio-gate-sentinel
+scripts/niri-hdr.py|bin|niri-hdr|%localbin%/niri-hdr,%globalbin%/niri-hdr
 units/wl-watcher/wl_watcher.py|pybin|wl-watcher|%localbin%/wl-watcher,%globalbin%/wl-watcher
