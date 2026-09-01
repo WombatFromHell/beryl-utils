@@ -40,9 +40,7 @@ NOTIFY_APP="${NOTIFY_APP:-chromium-wrapper}"
 CONTAINER_NAME="${CONTAINER_NAME:-}"
 BROWSER_BINARY="${BROWSER_BINARY:-}"
 FLATPAK_NAME="${FLATPAK_NAME:-}"
-IGPU_PCI_ID="${IGPU_PCI_ID:-0x164e}" # render-node PCI device id (igpu: Raphael APU)
-DGPU_PCI_ID="${DGPU_PCI_ID:-0x7550}" # render-node PCI device id (dgpu: RX 9070 XT)
-CHROME_GPU="${CHROME_GPU:-}"         # igpu|dgpu — selects the render node
+CHROME_GPU="${CHROME_GPU:-}" # igpu|dgpu — selects render node via vulkaninfo type
 
 # Legacy hardcoded path (today's brave-wrapper.sh behaviour), used when no
 # profile is requested or the named .conf does not exist.
@@ -78,7 +76,7 @@ load_profile() {
   # ponytail: profiles are sourced, not parsed — values must be valid bash.
   # Swap in a strict parser only if untrusted profiles become a concern.
   local env_bin="$BROWSER_BINARY" env_fp="$FLATPAK_NAME" env_cont="$CONTAINER_NAME"
-  local env_app="$NOTIFY_APP" env_igpu="$IGPU_PCI_ID" env_dgpu="$DGPU_PCI_ID" env_gpu="$CHROME_GPU"
+  local env_app="$NOTIFY_APP" env_gpu="$CHROME_GPU"
   # shellcheck source=/dev/null
   source "$f"
   # Environment always overrides the .conf (and clears the mutually
@@ -89,8 +87,6 @@ load_profile() {
   FLATPAK_NAME="${env_fp:-$FLATPAK_NAME}"
   CONTAINER_NAME="${env_cont:-$CONTAINER_NAME}"
   NOTIFY_APP="${env_app:-$NOTIFY_APP}"
-  IGPU_PCI_ID="${env_igpu:-$IGPU_PCI_ID}"
-  DGPU_PCI_ID="${env_dgpu:-$DGPU_PCI_ID}"
   CHROME_GPU="${env_gpu:-$CHROME_GPU}"
   if [[ -n $BROWSER_BINARY && -n $FLATPAK_NAME ]]; then
     die "profile '$PROFILE': BROWSER_BINARY and FLATPAK_NAME are mutually exclusive"
@@ -117,8 +113,6 @@ BROWSER_BINARY=
 # CONTAINER_NAME=bravebox
 # Optional overrides — an env var of the same name always wins:
 # NOTIFY_APP=chromium-wrapper
-# IGPU_PCI_ID=0x164e
-# DGPU_PCI_ID=0x7550
 CHROME_GPU=
 EOF
     echo "Wrote $f — edit it, then run: ${0##*/} -p $name"
@@ -218,36 +212,15 @@ resolve_profile_browser() {
 
 # ── GPU selection ────────────────────────────────────────────────────────────
 
-# CHROME_GPU=igpu|dgpu selects the GPU via --render-node-override: the only
-# lever that moves Chromium's Wayland GL renderer (env vars / --gpu-* are
-# ignored by the Wayland GL path). Match the render node by PCI id, then
-# verify the resolved /dev node still exists.
-# (detect_hybrid_graphics is provided by gpu-detect.sh)
+# GPU policy (hybrid guard, CHROME_GPU/DRI_PRIME, node selection) lives in
+# gpu-detect.sh's chromium_gpu_override; here we only inject the flag it
+# names. No override (exit 1) or missing device → Chromium picks its own GPU.
 apply_gpu_selection() {
-  local target="$IGPU_PCI_ID"
-  [[ $CHROME_GPU == "dgpu" ]] && target="$DGPU_PCI_ID"
   GPU_FLAGS=()
-  local rn v d dev
-  for rn in "$DRM_SYS_PATH"/renderD[0-9]*; do
-    [[ -r "$rn/device/vendor" && -r "$rn/device/device" ]] || continue
-    v=$(cat "$rn/device/vendor")
-    d=$(cat "$rn/device/device")
-    [[ $v == "0x1002" && $d == "$target" ]] || continue
-    dev="/dev/dri/${rn##*/}"
-    [[ -e $dev ]] || continue
-    GPU_FLAGS=(--render-node-override="$dev")
-    break
-  done
-}
-
-# Hybrid graphics: when ≥2 GPUs each drive an output, pick one explicitly.
-# Default to the iGPU; only CHROME_GPU=dgpu overrides that. Single-GPU systems
-# leave CHROME_GPU unset and let apply_gpu_selection's own default handle it.
-resolve_gpu_flags() {
-  if [[ -z $CHROME_GPU ]] && detect_hybrid_graphics &>/dev/null; then
-    CHROME_GPU=igpu
-  fi
-  apply_gpu_selection
+  local dev
+  dev=$(chromium_gpu_override) || return 0
+  [[ -e $dev ]] || return 0
+  GPU_FLAGS=(--render-node-override="$dev")
 }
 
 # ── Notifications / updates ──────────────────────────────────────────────────
@@ -359,6 +332,7 @@ _dispatch() {
     ;;
   flatpak-installed) is_flatpak_installed "${1:-$FLATPAK_NAME}" ;;
   detect-hybrid) detect_hybrid_graphics ;;
+  detect-gpu) apply_gpu_selection && printf '%s\n' "${GPU_FLAGS[@]:-}" ;;
   notify) notify "${1:-}" "${2:-}" "${3:-}" "${4:-}" ;;
   launch-flatpak) execute_launch flatpak flatpak "$@" ;;
   launch-distrobox) execute_launch distrobox "${1:-brave-browser}" "${@:2}" ;;
@@ -425,7 +399,7 @@ main() {
     disown || true
   fi
 
-  resolve_gpu_flags
+  apply_gpu_selection
   execute_launch "$LAUNCH_METHOD" "$BROWSER" "${GPU_FLAGS[@]}" "${launch_args[@]}"
 }
 

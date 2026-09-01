@@ -500,37 +500,39 @@ write_profile() {
   [[ $output == "0" ]]
 }
 
-@test "resolve_gpu_flags: hybrid defaults CHROME_GPU to igpu" {
+@test "chromium_gpu_override: hybrid defaults CHROME_GPU to igpu" {
   local drm="$TEST_ROOT/sys/drm"
   make_fake_drm "$drm"
   add_fake_card "$drm" card0 0000:13:00.0 DP-1
   add_fake_card "$drm" card1 0000:03:00.0 HDMI-A-1
-  run bash -c "export DRM_SYS_PATH='$drm'; source '$SOURCE_FILE'; resolve_gpu_flags; echo \"GPU=\${CHROME_GPU:-}\""
+  run bash -c "export DRM_SYS_PATH='$drm'; source '$SOURCE_FILE'; chromium_gpu_override || true; echo \"GPU=\${CHROME_GPU:-}\""
   [[ $output == *"GPU=igpu"* ]]
 }
 
-@test "resolve_gpu_flags: explicit CHROME_GPU=dgpu is honored" {
+@test "chromium_gpu_override: explicit CHROME_GPU=dgpu is honored" {
   local drm="$TEST_ROOT/sys/drm"
   make_fake_drm "$drm"
   add_fake_card "$drm" card0 0000:13:00.0 DP-1
   add_fake_card "$drm" card1 0000:03:00.0 HDMI-A-1
-  run bash -c "export DRM_SYS_PATH='$drm' CHROME_GPU=dgpu; source '$SOURCE_FILE'; resolve_gpu_flags; echo \"GPU=\${CHROME_GPU:-}\""
+  run bash -c "export DRM_SYS_PATH='$drm' CHROME_GPU=dgpu; source '$SOURCE_FILE'; chromium_gpu_override || true; echo \"GPU=\${CHROME_GPU:-}\""
   [[ $output == *"GPU=dgpu"* ]]
 }
 
-@test "resolve_gpu_flags: single GPU leaves CHROME_GPU unset" {
+@test "chromium_gpu_override: single GPU leaves CHROME_GPU unset" {
   local drm="$TEST_ROOT/sys/drm"
   make_fake_drm "$drm"
   add_fake_card "$drm" card0 0000:13:00.0 DP-1
-  run bash -c "export DRM_SYS_PATH='$drm'; source '$SOURCE_FILE'; resolve_gpu_flags; echo \"GPU=\${CHROME_GPU:-}\""
+  run bash -c "export DRM_SYS_PATH='$drm'; source '$SOURCE_FILE'; chromium_gpu_override || true; echo \"GPU=\${CHROME_GPU:-}\""
   [[ $output == "GPU=" ]]
 }
 
-@test "apply_gpu_selection: wrong PCI device id sets no override" {
+@test "apply_gpu_selection: non-hybrid with two render nodes injects no override" {
   local drm="$TEST_ROOT/sys/drm"
   make_fake_drm "$drm"
-  add_fake_render_node "$drm" renderD128 0x1002 0x9999
-  run bash -c "export DRM_SYS_PATH='$drm' CHROME_GPU=igpu; source '$SOURCE_FILE'; apply_gpu_selection; echo \"FLAGS=\${GPU_FLAGS[*]:-}\""
+  add_fake_card "$drm" card0 0000:03:00.0 DP-1
+  add_fake_render_node "$drm" renderD128 0x1002 0x7550
+  add_fake_render_node "$drm" renderD129 0x1002 0x164e
+  run bash -c "export DRM_SYS_PATH='$drm'; source '$SOURCE_FILE'; apply_gpu_selection; echo \"FLAGS=\${GPU_FLAGS[*]:-}\""
   [[ $output == "FLAGS=" ]]
 }
 
@@ -538,7 +540,7 @@ write_profile() {
 # matching render node only when a /dev/dri/renderD128 exists (real, or a fake
 # we can create). Where neither is possible the assertion would be false, so we
 # skip instead of asserting the safe-default-empty case.
-@test "apply_gpu_selection: matching PCI id injects --render-node-override" {
+@test "apply_gpu_selection: matching igpu preference injects --render-node-override" {
   local drm="$TEST_ROOT/sys/drm"
   if [[ ! -e /dev/dri/renderD128 ]]; then
     if ! mkdir -p /dev/dri 2>/dev/null || ! touch /dev/dri/renderD128 2>/dev/null; then
@@ -547,7 +549,10 @@ write_profile() {
     GPU_DEV_CREATED=1
   fi
   make_fake_drm "$drm"
+  add_fake_card "$drm" card0 0000:00:02.0 DP-1
+  add_fake_card "$drm" card1 0000:01:00.0 HDMI-A-1
   add_fake_render_node "$drm" renderD128 0x1002 0x164e
+  add_fake_render_node "$drm" renderD129 0x1002 0x7550
   run bash -c "export DRM_SYS_PATH='$drm' CHROME_GPU=igpu; source '$SOURCE_FILE'; apply_gpu_selection; echo \"FLAGS=\${GPU_FLAGS[*]:-}\""
   [[ $output == *"--render-node-override=/dev/dri/renderD128"* ]]
 }
