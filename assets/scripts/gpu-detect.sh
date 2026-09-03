@@ -116,8 +116,8 @@ vulkaninfo_gpu_types() {
 #   2. DRI_PRIME=N  — Nth render node by PCI bus address (Mesa convention)
 #   3. CHROME_GPU=igpu|dgpu  — prefer DISCRETE or INTEGRATED via vulkaninfo
 #   4. Auto-detect  — prefer DISCRETE_GPU, fall back to INTEGRATED_GPU
-#   5. No vulkaninfo → bus-order heuristic: lowest PCI bus = iGPU, otherwise
-#      the highest-bus node (discrete)
+#   5. No vulkaninfo → VRAM heuristic (iGPUs have 0 dedicated VRAM),
+#      bus-order fallback
 best_render_node_for_chromium() {
   local nodes=() n pci dev gpu_type="" override="" devid=""
   for n in "$DRM_SYS_PATH"/renderD[0-9]*; do
@@ -160,11 +160,24 @@ best_render_node_for_chromium() {
 
   if [[ -z $override ]]; then
     # Graceful degradation when vulkaninfo is missing or no device-id
-    # matches: bus-order heuristic. iGPUs sit on the SoC's low PCI bus
-    # (0000:00:xx), discrete GPUs on higher slots.
-    # ponytail: naive heuristic, wrong for exotic layouts; the vulkaninfo
-    # path above is exact when present.
-    if [[ ${CHROME_GPU:-} == igpu ]]; then
+    # matches: VRAM heuristic first (iGPUs have no dedicated VRAM in
+    # mem_info_vram_total), then bus-order fallback.
+    local igpu_dev="" dgpu_dev="" vram
+    for n in "${nodes[@]}"; do
+      if [[ -f "$DRM_SYS_PATH/${n##*|}/device/mem_info_vram_total" ]]; then
+        vram=$(<"$DRM_SYS_PATH/${n##*|}/device/mem_info_vram_total")
+        if ((vram == 0)); then
+          igpu_dev="${n##*|}"
+        else
+          dgpu_dev="${n##*|}"
+        fi
+      fi
+    done
+    if [[ ${CHROME_GPU:-} == igpu && -n ${igpu_dev:-} ]]; then
+      dev="$igpu_dev"
+    elif [[ -n ${dgpu_dev:-} ]]; then
+      dev="$dgpu_dev"
+    elif [[ ${CHROME_GPU:-} == igpu ]]; then
       dev="${nodes[0]##*|}"
     else
       dev="${nodes[-1]##*|}"
@@ -180,9 +193,10 @@ best_render_node_for_chromium() {
 # --render-node-override at all. Non-hybrid systems (one GPU drives every
 # connected output) get no override — Chromium picks its own GPU. Hybrid
 # systems with CHROME_GPU unset default to igpu. DRI_PRIME is explicit and
-# always honored, even on non-hybrid systems.
+# always honored, even on non-hybrid systems. CHROME_GPU is likewise explicit
+# and must not be silently ignored on non-hybrid hosts.
 chromium_gpu_override() {
-  if [[ -z ${DRI_PRIME:-} ]] && ! detect_hybrid_graphics &>/dev/null; then
+  if [[ -z ${DRI_PRIME:-} ]] && [[ -z ${CHROME_GPU:-} ]] && ! detect_hybrid_graphics &>/dev/null; then
     return 1
   fi
   [[ -z ${CHROME_GPU:-} ]] && CHROME_GPU=igpu
@@ -207,6 +221,8 @@ gpu_detect_self_test() {
   # device-ids (iGPU Raphael 0x164e, dGPU RX 9070 XT 0x7550)
   printf '0x164e\n' >"$root/sys/devices/pci/0000:00:02.0/device"
   printf '0x7550\n' >"$root/sys/devices/pci/0000:01:00.0/device"
+  printf '0\n' >"$root/sys/devices/pci/0000:00:02.0/mem_info_vram_total"
+  printf '16384000000\n' >"$root/sys/devices/pci/0000:01:00.0/mem_info_vram_total"
   mkdir -p "$root/bin"
   cat >"$root/bin/vulkaninfo" <<'VULK'
 #!/usr/bin/env bash
@@ -288,6 +304,8 @@ VULK
   mkdir -p "$nonhybrid/sys/devices/pci/0000:03:00.0" "$nonhybrid/sys/devices/pci/0000:13:00.0"
   printf '0x7550\n' >"$nonhybrid/sys/devices/pci/0000:03:00.0/device"
   printf '0x164e\n' >"$nonhybrid/sys/devices/pci/0000:13:00.0/device"
+  printf '16384000000\n' >"$nonhybrid/sys/devices/pci/0000:03:00.0/mem_info_vram_total"
+  printf '0\n' >"$nonhybrid/sys/devices/pci/0000:13:00.0/mem_info_vram_total"
   mkdir -p "$nonhybrid/sys/class/drm/card0/card0-DP-1"
   mkdir -p "$nonhybrid/sys/class/drm/renderD128" "$nonhybrid/sys/class/drm/renderD129"
   ln -s "$nonhybrid/sys/devices/pci/0000:03:00.0" "$nonhybrid/sys/class/drm/card0/device"
@@ -302,7 +320,24 @@ VULK
     [[ $out == "/dev/dri/renderD128" ]] || { echo "self-test: non-hybrid auto-detect = $out" >&2; exit 1; }
     out="$(chromium_gpu_override)"
     [[ -z $out ]] || { echo "self-test: non-hybrid override = $out" >&2; exit 1; }
+    CHROME_GPU=igpu out="$(chromium_gpu_override)"
+    [[ $out == "/dev/dri/renderD129" ]] || { echo "self-test: non-hybrid CHROME_GPU=igpu = $out" >&2; exit 1; }
+    CHROME_GPU=dgpu out="$(chromium_gpu_override)"
+    [[ $out == "/dev/dri/renderD128" ]] || { echo "self-test: non-hybrid CHROME_GPU=dgpu = $out" >&2; exit 1; }
     echo "gpu-detect non-hybrid self-test ok"
+  ' || return 1
+
+  # Non-hybrid + no vulkaninfo: VRAM heuristic must still pick the right
+  # GPU (iGPU=renderD129 with VRAM=0, dGPU=renderD128 with VRAM>0).
+  # shellcheck disable=SC2016
+  env DRM_SYS_PATH="$nonhybrid/sys/class/drm" SELFTEST_SELF="$self" \
+    VULKANINFO_BIN="$root/bin/not-there/vulkaninfo" bash -c '
+    source "$SELFTEST_SELF"
+    out="$(best_render_node_for_chromium)"
+    [[ $out == "/dev/dri/renderD128" ]] || { echo "self-test: non-hybrid no-vulkaninfo auto = $out" >&2; exit 1; }
+    out="$(CHROME_GPU=igpu best_render_node_for_chromium)"
+    [[ $out == "/dev/dri/renderD129" ]] || { echo "self-test: non-hybrid no-vulkaninfo igpu = $out" >&2; exit 1; }
+    echo "gpu-detect non-hybrid no-vulkaninfo self-test ok"
   ' || return 1
 
   # Single-GPU topology: best_render_node_for_chromium returns nothing
