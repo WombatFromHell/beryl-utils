@@ -21,6 +21,9 @@ setup() {
   make_stub notify-send
 
   stub_chromium_flags
+  # Pin the stub: resolution is sibling-first, and the sibling of the repo
+  # copy under test is the real chromium-flags.sh, not the stub.
+  export CHROMIUM_FLAGS_SCRIPT="$HOME/.local/bin/scripts/chromium-flags.sh"
 }
 
 teardown() {
@@ -115,7 +118,7 @@ if [[ "$1" == *"chromium-flags.sh"* ]]; then exec "$@"; fi
 # Update: args are `-n <container> -- <cmd> ...`; drop the prefix.
 shift 2; shift
 case "$1" in
-  dnf) if [[ "$2" == "check-update" ]]; then
+  dnf) if [[ "$2" == "check-upgrade" ]]; then
          [[ "${MOCK_DNF_UPDATE:-no}" == "yes" ]] && exit 100 || exit 0; fi; exit 1;;
   sudo) if [[ "$2" == "-n" && "$3" == "true" ]]; then
           [[ "${MOCK_SUDO_OK:-yes}" == "yes" ]] && exit 0 || exit 1; fi
@@ -130,7 +133,7 @@ MOCK
 stub_dnf() {
   cat >"$TEST_ROOT/bin/dnf" <<'MOCK'
 #!/bin/bash
-if [[ "$1" == "check-update" ]]; then
+if [[ "$1" == "check-upgrade" ]]; then
   [[ "${MOCK_DNF_UPDATE:-no}" == "yes" ]] && exit 100 || exit 0
 fi
 exit 1
@@ -468,6 +471,28 @@ write_profile() {
   [[ $status -eq 0 ]]
   [[ $output == *"profile 'ghost' not found"* ]]
   [[ $output == *"chromium-flags: distrobox-enter -n bravebox -- brave"* ]]
+}
+
+@test "main: explicit executable path wraps whole command" {
+  make_stub mypathlauncher
+  local exe="$TEST_ROOT/bin/mypathlauncher"
+  run_main "$exe" run --brand=stable appid %U
+  [[ $status -eq 0 ]]
+  [[ $output == *"chromium-flags: $exe"*"run --brand=stable appid %U"* ]]
+  [[ $output != *"Checking for"* ]]
+}
+
+@test "main: explicit command name on PATH wraps whole command" {
+  make_stub mycmdtool
+  run_main mycmdtool run --brand=stable appid %U
+  [[ $status -eq 0 ]]
+  [[ $output == *"chromium-flags: $TEST_ROOT/bin/mycmdtool"*"run --brand=stable appid %U"* ]]
+}
+
+@test "main: explicit non-executable path is rejected" {
+  run_main /nonexistent/flatpak run appid
+  [[ $status -ne 0 ]]
+  [[ $output == *"not executable"* ]]
 }
 
 # ── GPU selection ─────────────────────────────────────────────────────────────

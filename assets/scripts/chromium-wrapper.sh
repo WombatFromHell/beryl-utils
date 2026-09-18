@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Generic Chromium browser wrapper: launches any Chromium fork via host binary,
 # flatpak, or (custom-named) distrobox container, driven by per-browser profile
-# files. Injects flags through chromium-flags.sh; runs background updates for
-# the strategy in use.
+# files, or wraps an arbitrary command. Injects flags through
+# chromium-flags.sh; background updates run for the profile/legacy strategies.
 #
 # Profiles: ~/.config/chromium-wrapper/<profile>.conf (env: PROFILE_DIR)
 #   chromium-wrapper.sh -p brave <URL>     load profile "brave"
@@ -11,17 +11,26 @@
 
 set -euo pipefail
 
+# scripts_dir: resolve symlinked installs (install.sh's ~/.local/bin links) via
+# realpath; fall back to the raw path on minimal systems without coreutils.
+if command -v realpath &>/dev/null; then
+  scripts_dir="$(cd "$(dirname "$(realpath "${BASH_SOURCE[0]}")")" && pwd)"
+else
+  scripts_dir="$(cd "${BASH_SOURCE[0]%/*}" && pwd)"
+fi
+
 # chromium-flags.sh is mandatory: the browser is always launched through it.
-# ponytail: prefer a PATH-resolved chromium-flags.sh (covers install.sh's
-# symlink and the store bin); fall back to a sibling of this script.
-scripts_dir="$(cd "${BASH_SOURCE[0]%/*}" && pwd)"
-CHROMIUM_FLAGS_SCRIPT="$(command -v chromium-flags.sh 2>/dev/null || true)"
+# Order: env override (tests), this script's realpath sibling, then PATH. The
+# sibling is deterministic (install.sh copies everything into one dir; the
+# store puts all scripts in bin/) — PATH-hunting once let a stale Nix-store
+# /usr/bin copy shadow the fresh sibling under GUI/systemd launches.
+CHROMIUM_FLAGS_SCRIPT="${CHROMIUM_FLAGS_SCRIPT:-$scripts_dir/chromium-flags.sh}"
 [[ -x $CHROMIUM_FLAGS_SCRIPT ]] ||
-  CHROMIUM_FLAGS_SCRIPT="$scripts_dir/chromium-flags.sh"
-if [[ ! -x $CHROMIUM_FLAGS_SCRIPT ]]; then
+  CHROMIUM_FLAGS_SCRIPT="$(command -v chromium-flags.sh 2>/dev/null || true)"
+[[ -x $CHROMIUM_FLAGS_SCRIPT ]] || {
   echo "Error: chromium-flags.sh not found" >&2
   exit 1
-fi
+}
 readonly CHROMIUM_FLAGS_SCRIPT
 
 # Overridable for tests; only PROFILE_DIR/CONTAINER_ENV_FILE/DRM_SYS_PATH are
@@ -249,20 +258,22 @@ run_command_or_fail() {
 _check_update() {
   if [[ $1 == "flatpak" ]]; then
     local probe
-    probe=$(flatpak update --no-deploy -y "$2" 2>&1) || true
+    probe=$(LC_ALL=C flatpak update --no-deploy -y "$2" 2>&1) || true
     [[ $probe != *"Nothing to do"* ]]
     return
   fi
-  local prefix=()
+  local prefix=() rc=0
   [[ $1 == "distrobox" ]] && prefix=(distrobox-enter -n "$CONTAINER_NAME" --)
-  "${prefix[@]}" dnf check-update "$2" &>/dev/null
-  [[ $? -eq 100 ]] # 100 = updates available; 0 = none; anything else = error
+  # ponytail: rc captured locally — a bare `$?` here only survives because
+  # callers use `if !`, which suppresses errexit.
+  "${prefix[@]}" dnf check-upgrade "$2" &>/dev/null || rc=$?
+  [[ $rc -eq 100 ]] # 100 = updates available; 0 = none; anything else = error
 }
 
 _apply_update() {
   local strategy="$1" target="$2" out rc=0 prefix=()
   if [[ $strategy == "flatpak" ]]; then
-    out=$(flatpak update -y "$target" 2>&1) || rc=$?
+    out=$(LC_ALL=C flatpak update -y "$target" 2>&1) || rc=$?
     if [[ $rc -eq 0 ]] && [[ $out == *"Updates complete"* ]]; then
       echo "$out"
       notify "Browser Updated" "Restart the browser to finish updating."
@@ -349,6 +360,7 @@ usage() {
   cat <<EOF
 Usage: ${0##*/} [-p PROFILE] [ARGS...]     Launch a Chromium browser
        ${0##*/} --init PROFILE             Write a template profile .conf
+       ${0##*/} EXECUTABLE [ARGS...]       Wrap an arbitrary command via chromium-flags.sh
        ${0##*/} --helper-<name> [ARGS...]  Internal (used by tests/spawn-browser)
 
   -p PROFILE    load \$PROFILE_DIR/PROFILE.conf (env: BROWSER_PROFILE;
@@ -384,6 +396,19 @@ main() {
   done
   if [[ $explicit == true && -z $profile ]]; then
     die "-p requires a profile name (try: ${0##*/} --init brave)"
+  fi
+
+  # Explicit executable first arg (absolute path, or a name PATH-resolved like
+  # `flatpak run dev.vencord.Vesktop`): wrap the whole command via
+  # chromium-flags.sh, appending GPU flags so a `flatpak run <appid>` keeps
+  # them after the app id. No profile/legacy resolution, no background update —
+  # we can't know what package owns the command.
+  local cmd="${launch_args[0]:-}"
+  [[ $cmd != /* ]] && cmd="$(command -v "$cmd" 2>/dev/null || true)"
+  if [[ -n $cmd ]]; then
+    [[ -x $cmd ]] || die "command not executable: ${launch_args[0]}"
+    apply_gpu_selection
+    exec "$CHROMIUM_FLAGS_SCRIPT" "$cmd" "${launch_args[@]:1}" "${GPU_FLAGS[@]}"
   fi
 
   # No profile requested, or the named .conf does not exist → legacy path.

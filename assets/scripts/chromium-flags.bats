@@ -96,6 +96,17 @@ EOF
   [ "${lines[4]}" = "%U" ]
 }
 
+@test "Strategy: Flatpak injection skips run global options" {
+  echo "--vesktop-flag" >"$TEST_CONFIG"
+  run bash chromium-flags.sh --dry-run /usr/bin/flatpak run --branch=stable --arch=x86_64 --command=startvesktop --file-forwarding dev.vencord.Vesktop @@u %U @@
+  [ "${lines[0]}" = "/usr/bin/flatpak" ]
+  [ "${lines[1]}" = "run" ]
+  [ "${lines[4]}" = "--command=startvesktop" ]
+  [ "${lines[6]}" = "dev.vencord.Vesktop" ]
+  [ "${lines[7]}" = "--vesktop-flag" ]
+  [ "${lines[8]}" = "@@u" ]
+}
+
 @test "Strategy: Distrobox injection after '--'" {
   echo "--distro-flag" >"$TEST_CONFIG"
   run bash chromium-flags.sh --dry-run distrobox-enter -n box -- brave-browser

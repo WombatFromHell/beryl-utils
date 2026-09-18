@@ -1,61 +1,35 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-#==============================================================================
-# Chromium Flags Loader (Strategy Pattern Refactor)
-#==============================================================================
-
 readonly FLAGS_CONFIG="${FLAGS_CONFIG:-${HOME}/.config/chromium-flags.conf}"
 
-#------------------------------------------------------------------------------
-# DATA LAYER: Load and clean flags
-#------------------------------------------------------------------------------
+# Skip blank/comment lines. `read` with default IFS already trims surrounding
+# whitespace, so the read line is the trimmed flag.
 load_flags() {
-  if [[ ! -f $FLAGS_CONFIG ]]; then
-    return 0
-  fi
+  [[ -f $FLAGS_CONFIG ]] || return 0
 
-  local flags=()
-  while IFS= read -r line || [[ -n $line ]]; do
-    # Trim whitespace and skip empty/comments
-    local trimmed
-    trimmed=$(echo "$line" | xargs)
-    [[ -z $trimmed || $trimmed == \#* ]] && continue
-    flags+=("$trimmed")
+  local flags=() line
+  while read -r line || [[ -n $line ]]; do
+    [[ -n $line && $line != \#* ]] && flags+=("$line")
   done <"$FLAGS_CONFIG"
-
   printf '%s\n' "${flags[@]}"
 }
 
-#------------------------------------------------------------------------------
-# STRATEGY LAYER: Argument Transformation Logic
-# Each strategy receives the FULL list of arguments passed to the script.
-#------------------------------------------------------------------------------
-
+# Each strategy rewrites the full argument list, injecting FLAGS_LIST after
+# the command / app id / browser binary as appropriate.
 strategy_standard() {
-  local args=("$@")
-  local cmd="${args[0]:-}"
-  shift # Remove command from array for processing
-
-  local remaining=("${args[@]:1}")
-  local flags=("${FLAGS_LIST[@]}")
-
-  # Output: [command] [flags...] [remaining args...]
-  printf '%s\n' "$cmd" "${flags[@]}" "${remaining[@]}"
+  printf '%s\n' "$1" "${FLAGS_LIST[@]}" "${@:2}"
 }
 
 strategy_flatpak() {
   local args=("$@")
-  # Expected format: flatpak run <app-id> [args...]
-  local cmd="${args[0]:-}"
-  local action="${args[1]:-}"
-  local app_id="${args[2]:-}"
-
-  shift 3 || true # Safely shift to get remaining args
-  local remaining=("$@")
-  local flags=("${FLAGS_LIST[@]}")
-
-  printf '%s\n' "$cmd" "$action" "$app_id" "${flags[@]}" "${remaining[@]}"
+  # Format: flatpak run [global opts...] <app-id> [args...]. Skip the global
+  # options after `run` so flags land right after the app id — the only
+  # position flatpak forwards them to the launched command.
+  local i=2
+  while ((i < ${#args[@]})) && [[ ${args[i]} == -* ]]; do ((i++)); done
+  printf '%s\n' "${args[0]:-}" "${args[1]:-}" "${args[@]:2:i-2}" \
+    "${args[i]:-}" "${FLAGS_LIST[@]}" "${args[@]:i+1}"
 }
 
 strategy_distrobox() {
@@ -80,10 +54,6 @@ strategy_distrobox() {
   printf '%s\n' "${result[@]}"
 }
 
-#------------------------------------------------------------------------------
-# DISPATCHER / CONTEXT LAYER
-#------------------------------------------------------------------------------
-
 main() {
   local dry_run=false
   if [[ ${1:-} == "--dry-run" ]]; then
@@ -92,20 +62,21 @@ main() {
   fi
 
   if [[ $# -lt 1 ]]; then
-    echo "Usage: chromium-flags.sh [--dry-run] <command> [args...]" >&2
+    echo "Usage: ${0##*/} [--dry-run] <command> [args...]" >&2
     exit 1
   fi
 
   # Load flags into a global array for strategies to access
   mapfile -t FLAGS_LIST < <(load_flags)
 
-  local command="${1:-}"
+  local cmd="${1:-}"
   local final_args=()
 
-  # Strategy Selection (The "Context")
-  if [[ $command == "flatpak" && ${2:-} == "run" ]]; then
+  # Dispatch on the basename so an absolute path (e.g. /usr/bin/flatpak)
+  # selects the same strategy as the bare command name.
+  if [[ ${cmd##*/} == "flatpak" && ${2:-} == "run" ]]; then
     mapfile -t final_args < <(strategy_flatpak "$@")
-  elif [[ $command == "distrobox-enter" || $command == "distrobox" ]]; then
+  elif [[ ${cmd##*/} == "distrobox-enter" || ${cmd##*/} == "distrobox" ]]; then
     mapfile -t final_args < <(strategy_distrobox "$@")
   else
     mapfile -t final_args < <(strategy_standard "$@")
