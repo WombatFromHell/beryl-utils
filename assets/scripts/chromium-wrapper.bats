@@ -3,7 +3,7 @@
 # shellcheck disable=SC2030,SC2031 # bats runs each @test in a subshell; `export` here is the intended way to pass env into `run bash -c` children
 bats_require_minimum_version 1.5.0
 
-SOURCE_FILE="${BATS_TEST_DIRNAME}/chromium-wrapper.sh"
+SOURCE_FILE="$(realpath "${BATS_TEST_DIRNAME}/chromium-wrapper.sh")"
 
 # ── Setup / Teardown ─────────────────────────────────────────────────────────
 
@@ -15,6 +15,8 @@ setup() {
 
   export HOME="$TEST_ROOT/home"
   export PATH="$TEST_ROOT/bin:$HOME/.local/bin/scripts:$PATH"
+  # Hermetic: don't leak the host's GPU selection into the test child.
+  unset CHROME_GPU DRI_PRIME
   # Collapse the deferred-update sleep so tests run at normal speed.
   export UPDATE_DEFER_SECONDS=0
   # No-op notify so update paths never reach a real notify-send.
@@ -24,6 +26,15 @@ setup() {
   # Pin the stub: resolution is sibling-first, and the sibling of the repo
   # copy under test is the real chromium-flags.sh, not the stub.
   export CHROMIUM_FLAGS_SCRIPT="$HOME/.local/bin/scripts/chromium-flags.sh"
+
+  # Symlink the basic tools the script's shebang + body need into the test
+  # bin, so a hermetic PATH (test bin only) can still run the script — while
+  # still excluding the host's real brave binaries.
+  local tool src
+  for tool in bash sh env grep realpath xargs dirname cat sed awk sort head tail tr cut mkdir rm touch; do
+    src="$(command -v "$tool" 2>/dev/null || true)"
+    [[ -n $src ]] && ln -sf "$src" "$TEST_ROOT/bin/$tool"
+  done
 }
 
 teardown() {
@@ -153,9 +164,6 @@ MOCK
   chmod +x "$TEST_ROOT/bin/sudo"
 }
 
-# Fake /sys/class/drm tree for GPU tests.
-make_fake_drm() { mkdir -p "$1"; }
-
 add_fake_card() {
   local drm="$1" card="$2" pci="$3" conn="$4" conn_status="${5:-connected}"
   mkdir -p "$drm/$card/$pci" "$drm/$card/$conn"
@@ -173,6 +181,13 @@ add_fake_render_node() {
 # Run main() as a subprocess so `exec` and background updates behave naturally.
 run_main() {
   run bash -c "HOME='$HOME' PATH='$PATH' '${SOURCE_FILE}' $(printf '%q ' "$@")"
+}
+
+# Hermetic PATH (test bin only): the host has real brave binaries on PATH,
+# which the local-first order would pick up. Launch-path tests use this so a
+# stub (or its absence) is the only signal.
+run_main_hermetic() {
+  run bash -c "HOME='$HOME' PATH='$TEST_ROOT/bin' '${SOURCE_FILE}' $(printf '%q ' "$@")"
 }
 
 # ── Mandatory guard ───────────────────────────────────────────────────────────
@@ -245,43 +260,96 @@ MOCK
   [[ $status -ne 0 ]]
 }
 
-# ── find_browser ──────────────────────────────────────────────────────────────
+# ── find_browser (sets BROWSER/LAUNCH_METHOD/UPDATE_*; order legacy>flatpak>distrobox) ──
 
-@test "find_browser: returns flatpak when installed" {
-  stub_flatpak yes
-  export FLATPAK_NAME="com.brave.Browser"
-  run bash -c "export FLATPAK_NAME='com.brave.Browser'; source '$SOURCE_FILE'; find_browser"
-  [[ $status -eq 0 ]]
-  [[ $output == "flatpak" ]]
-}
-
-@test "find_browser: returns first legacy candidate on PATH" {
+# Hermetic PATH (test bin only): the host has real brave binaries on PATH,
+# which the local-first order would pick up. The stub (or its absence) is the
+# only signal.
+@test "find_browser: local candidate on PATH -> direct (legacy-first)" {
   make_stub brave
-  run bash -c "source '$SOURCE_FILE'; find_browser"
+  run bash -c "export PATH='$TEST_ROOT/bin'; source '$SOURCE_FILE'; find_browser; echo \"B=\${BROWSER:-} M=\${LAUNCH_METHOD:-}\""
   [[ $status -eq 0 ]]
-  [[ $output == "brave" ]]
+  [[ $output == *"B=brave M=direct"* ]]
 }
 
-@test "find_browser: returns brave-browser when bravebox container exists" {
+@test "find_browser: flatpak when no local binary (auto order)" {
+  stub_flatpak yes
+  run bash -c "export FLATPAK_NAME='com.brave.Browser' PATH='$TEST_ROOT/bin'; source '$SOURCE_FILE'; find_browser; echo \"B=\${BROWSER:-} M=\${LAUNCH_METHOD:-}\""
+  [[ $status -eq 0 ]]
+  [[ $output == *"B=flatpak M=flatpak"* ]]
+}
+
+@test "find_browser: brave-browser when only it is on PATH" {
+  make_stub brave-browser
+  run bash -c "export PATH='$TEST_ROOT/bin'; source '$SOURCE_FILE'; find_browser; echo \"B=\${BROWSER:-}\""
+  [[ $status -eq 0 ]]
+  [[ $output == *"B=brave-browser"* ]]
+}
+
+@test "find_browser: brave-browser-stable when only it is on PATH" {
+  make_stub brave-browser-stable
+  run bash -c "export PATH='$TEST_ROOT/bin'; source '$SOURCE_FILE'; find_browser; echo \"B=\${BROWSER:-}\""
+  [[ $status -eq 0 ]]
+  [[ $output == *"B=brave-browser-stable"* ]]
+}
+
+@test "find_browser: brave-browser-beta when only it is on PATH" {
+  make_stub brave-browser-beta
+  run bash -c "export PATH='$TEST_ROOT/bin'; source '$SOURCE_FILE'; find_browser; echo \"B=\${BROWSER:-}\""
+  [[ $status -eq 0 ]]
+  [[ $output == *"B=brave-browser-beta"* ]]
+}
+
+@test "find_browser: brave-browser beats brave-browser-beta (candidate order)" {
+  make_stub brave-browser
+  make_stub brave-browser-beta
+  run bash -c "export PATH='$TEST_ROOT/bin'; source '$SOURCE_FILE'; find_browser; echo \"B=\${BROWSER:-}\""
+  [[ $status -eq 0 ]]
+  [[ $output == *"B=brave-browser"* ]]
+}
+
+@test "find_browser: distrobox container when no local binary/flatpak" {
   stub_distrobox
-  run bash -c "source '$SOURCE_FILE'; find_browser"
+  run bash -c "export PATH='$TEST_ROOT/bin'; source '$SOURCE_FILE'; find_browser; echo \"B=\${BROWSER:-} M=\${LAUNCH_METHOD:-}\""
   [[ $status -eq 0 ]]
-  [[ $output == "brave-browser" ]]
+  [[ $output == *"B=brave-browser M=distrobox"* ]]
 }
 
-@test "find_browser: helper dispatch uses legacy container default" {
+@test "find_browser: --mode flatpak pins to flatpak (ignores local binary)" {
+  stub_flatpak yes
+  make_stub brave
+  run bash -c "export FLATPAK_NAME='com.brave.Browser' PATH='$TEST_ROOT/bin' MODE=flatpak; source '$SOURCE_FILE'; find_browser; echo \"B=\${BROWSER:-}\""
+  [[ $status -eq 0 ]]
+  [[ $output == *"B=flatpak"* ]]
+}
+
+@test "find_browser: --mode legacy pins to local binary (ignores flatpak)" {
+  stub_flatpak yes
+  make_stub brave
+  run bash -c "export FLATPAK_NAME='com.brave.Browser' PATH='$TEST_ROOT/bin' MODE=legacy; source '$SOURCE_FILE'; find_browser; echo \"B=\${BROWSER:-} M=\${LAUNCH_METHOD:-}\""
+  [[ $status -eq 0 ]]
+  [[ $output == *"B=brave M=direct"* ]]
+}
+
+@test "find_browser: --mode distrobox pins to container (ignores local binary)" {
+  stub_distrobox
+  make_stub brave
+  run bash -c "export PATH='$TEST_ROOT/bin' MODE=distrobox; source '$SOURCE_FILE'; find_browser; echo \"B=\${BROWSER:-} M=\${LAUNCH_METHOD:-}\""
+  [[ $status -eq 0 ]]
+  [[ $output == *"B=brave-browser M=distrobox"* ]]
+}
+
+@test "find_browser: --mode flatpak with nothing found is fatal" {
   stub_flatpak no
-  stub_distrobox
-  run_main --helper-find-browser
-  [[ $status -eq 0 ]]
-  [[ $output == "brave-browser" ]]
+  run bash -c "export FLATPAK_NAME='com.brave.Browser' PATH='$TEST_ROOT/bin' MODE=flatpak; source '$SOURCE_FILE'; find_browser"
+  [[ $status -ne 0 ]]
 }
 
 @test "find_browser: returns nonzero when nothing found" {
   stub_flatpak no
   stub_distrobox
   export MOCK_DISTROBOX_CONTAINER=no
-  run bash -c "source '$SOURCE_FILE'; find_browser"
+  run bash -c "export PATH='$TEST_ROOT/bin'; source '$SOURCE_FILE'; find_browser"
   [[ $status -ne 0 ]]
 }
 
@@ -372,34 +440,32 @@ write_profile() {
 
 # ── resolve_legacy_browser (three launch codepaths) ──────────────────────────
 
-@test "resolve_legacy_browser: flatpak installed -> flatpak" {
+@test "resolve_legacy_browser: local candidate -> direct (legacy-first)" {
+  stub_flatpak no
+  make_stub brave
+  run bash -c "export PATH='$TEST_ROOT/bin'; source '$SOURCE_FILE'; legacy_setup; resolve_legacy_browser; echo \"M=\${LAUNCH_METHOD:-} B=\${BROWSER:-}\""
+  [[ $output == *"M=direct"* ]]
+  [[ $output == *"B=brave"* ]]
+}
+
+@test "resolve_legacy_browser: flatpak when no local binary -> flatpak" {
   stub_flatpak yes
-  run bash -c "source '$SOURCE_FILE'; legacy_setup; resolve_legacy_browser; echo \"M=\${LAUNCH_METHOD:-}\""
+  run bash -c "export PATH='$TEST_ROOT/bin'; source '$SOURCE_FILE'; legacy_setup; resolve_legacy_browser; echo \"M=\${LAUNCH_METHOD:-}\""
   [[ $output == *"M=flatpak"* ]]
 }
 
-@test "resolve_legacy_browser: not in container + candidate -> distrobox" {
-  stub_flatpak no
-  make_stub brave
-  run bash -c "source '$SOURCE_FILE'; legacy_setup; resolve_legacy_browser; echo \"M=\${LAUNCH_METHOD:-} B=\${BROWSER:-}\""
+@test "resolve_legacy_browser: distrobox container when no local/flatpak" {
+  stub_distrobox
+  run bash -c "export PATH='$TEST_ROOT/bin'; source '$SOURCE_FILE'; legacy_setup; resolve_legacy_browser; echo \"M=\${LAUNCH_METHOD:-} B=\${BROWSER:-}\""
   [[ $output == *"M=distrobox"* ]]
-  [[ $output == *"B=brave"* ]]
-}
-
-@test "resolve_legacy_browser: in container + candidate -> direct" {
-  stub_flatpak no
-  make_stub brave
-  touch "$TEST_ROOT/fake_containerenv"
-  run bash -c "export CONTAINER_ENV_FILE='$TEST_ROOT/fake_containerenv'; source '$SOURCE_FILE'; legacy_setup; resolve_legacy_browser; echo \"M=\${LAUNCH_METHOD:-} B=\${BROWSER:-}\""
-  [[ $output == *"M=direct"* ]]
-  [[ $output == *"B=brave"* ]]
+  [[ $output == *"B=brave-browser"* ]]
 }
 
 @test "resolve_legacy_browser: nothing found is fatal" {
   stub_flatpak no
   stub_distrobox
   export MOCK_DISTROBOX_CONTAINER=no
-  run bash -c "source '$SOURCE_FILE'; legacy_setup; resolve_legacy_browser"
+  run bash -c "export PATH='$TEST_ROOT/bin'; source '$SOURCE_FILE'; legacy_setup; resolve_legacy_browser"
   [[ $status -ne 0 ]]
   [[ $output == *"no Brave found"* ]]
 }
@@ -436,41 +502,76 @@ write_profile() {
 
 # ── main() integration: the three launch codepaths (legacy) ───────────────────
 
-@test "main: legacy flatpak launches via chromium-flags" {
-  stub_flatpak yes
-  run_main
-  [[ $status -eq 0 ]]
-  [[ $output == *"chromium-flags: flatpak run com.brave.Browser"* ]]
-}
-
-@test "main: legacy distrobox launches through bravebox" {
-  stub_flatpak no
-  stub_distrobox
+@test "main: legacy local binary launches direct (legacy-first)" {
   make_stub brave
-  run_main
-  [[ $status -eq 0 ]]
-  [[ $output == *"chromium-flags: distrobox-enter -n bravebox -- brave"* ]]
-}
-
-@test "main: legacy direct launches host binary when in container" {
-  stub_flatpak no
-  make_stub brave
-  touch "$TEST_ROOT/fake_containerenv"
-  export CONTAINER_ENV_FILE="$TEST_ROOT/fake_containerenv"
-  run_main
+  run_main_hermetic
   [[ $status -eq 0 ]]
   [[ $output == *"chromium-flags: brave"* ]]
 }
 
-@test "main: missing profile falls back to legacy with a warning" {
-  stub_flatpak no
+@test "main: legacy flatpak when no local binary" {
+  stub_flatpak yes
+  run_main_hermetic
+  [[ $status -eq 0 ]]
+  [[ $output == *"chromium-flags: flatpak run com.brave.Browser"* ]]
+}
+
+@test "main: legacy distrobox when no local binary/flatpak" {
+  stub_distrobox
+  run_main_hermetic
+  [[ $status -eq 0 ]]
+  [[ $output == *"chromium-flags: distrobox-enter -n bravebox -- brave-browser"* ]]
+}
+
+@test "main: --mode flatpak pins to flatpak (ignores local binary)" {
+  stub_flatpak yes
+  make_stub brave
+  run_main_hermetic --mode flatpak
+  [[ $status -eq 0 ]]
+  [[ $output == *"chromium-flags: flatpak run com.brave.Browser"* ]]
+}
+
+@test "main: --mode legacy pins to local binary (ignores flatpak)" {
+  stub_flatpak yes
+  make_stub brave
+  run_main_hermetic --mode legacy
+  [[ $status -eq 0 ]]
+  [[ $output == *"chromium-flags: brave"* ]]
+}
+
+@test "main: --mode distrobox pins to container (ignores local binary)" {
   stub_distrobox
   make_stub brave
+  run_main_hermetic --mode distrobox
+  [[ $status -eq 0 ]]
+  [[ $output == *"chromium-flags: distrobox-enter -n bravebox -- brave-browser"* ]]
+}
+
+@test "main: --mode and -p are mutually exclusive" {
+  run_main_hermetic --mode flatpak -p brave
+  [[ $status -ne 0 ]]
+  [[ $output == *"mutually exclusive"* ]]
+}
+
+@test "main: --mode invalid value is fatal" {
+  run_main_hermetic --mode bogus
+  [[ $status -ne 0 ]]
+  [[ $output == *"invalid --mode"* ]]
+}
+
+@test "main: --mode missing value is fatal" {
+  run_main_hermetic --mode
+  [[ $status -ne 0 ]]
+  [[ $output == *"--mode requires a value"* ]]
+}
+
+@test "main: missing profile falls back to legacy with a warning" {
+  make_stub brave
   export PROFILE_DIR="$TEST_ROOT/profiles"
-  run_main -p ghost
+  run_main_hermetic -p ghost
   [[ $status -eq 0 ]]
   [[ $output == *"profile 'ghost' not found"* ]]
-  [[ $output == *"chromium-flags: distrobox-enter -n bravebox -- brave"* ]]
+  [[ $output == *"chromium-flags: brave"* ]]
 }
 
 @test "main: explicit executable path wraps whole command" {
@@ -499,7 +600,7 @@ write_profile() {
 
 @test "detect_hybrid_graphics: two GPUs each driving an output => hybrid" {
   local drm="$TEST_ROOT/sys/drm"
-  make_fake_drm "$drm"
+  mkdir -p "$drm"
   add_fake_card "$drm" card0 0000:13:00.0 DP-1
   add_fake_card "$drm" card1 0000:03:00.0 HDMI-A-1
   run bash -c "export DRM_SYS_PATH='$drm'; source '$SOURCE_FILE'; detect_hybrid_graphics"
@@ -509,7 +610,7 @@ write_profile() {
 
 @test "detect_hybrid_graphics: single active GPU => not hybrid" {
   local drm="$TEST_ROOT/sys/drm"
-  make_fake_drm "$drm"
+  mkdir -p "$drm"
   add_fake_card "$drm" card0 0000:13:00.0 DP-1
   run bash -c "export DRM_SYS_PATH='$drm'; source '$SOURCE_FILE'; detect_hybrid_graphics"
   [[ $status -ne 0 ]]
@@ -518,7 +619,7 @@ write_profile() {
 
 @test "detect_hybrid_graphics: no connected outputs => not hybrid" {
   local drm="$TEST_ROOT/sys/drm"
-  make_fake_drm "$drm"
+  mkdir -p "$drm"
   add_fake_card "$drm" card0 0000:13:00.0 DP-1 disconnected
   run bash -c "export DRM_SYS_PATH='$drm'; source '$SOURCE_FILE'; detect_hybrid_graphics"
   [[ $status -ne 0 ]]
@@ -527,7 +628,7 @@ write_profile() {
 
 @test "chromium_gpu_override: hybrid defaults CHROME_GPU to igpu" {
   local drm="$TEST_ROOT/sys/drm"
-  make_fake_drm "$drm"
+  mkdir -p "$drm"
   add_fake_card "$drm" card0 0000:13:00.0 DP-1
   add_fake_card "$drm" card1 0000:03:00.0 HDMI-A-1
   run bash -c "export DRM_SYS_PATH='$drm'; source '$SOURCE_FILE'; chromium_gpu_override || true; echo \"GPU=\${CHROME_GPU:-}\""
@@ -536,7 +637,7 @@ write_profile() {
 
 @test "chromium_gpu_override: explicit CHROME_GPU=dgpu is honored" {
   local drm="$TEST_ROOT/sys/drm"
-  make_fake_drm "$drm"
+  mkdir -p "$drm"
   add_fake_card "$drm" card0 0000:13:00.0 DP-1
   add_fake_card "$drm" card1 0000:03:00.0 HDMI-A-1
   run bash -c "export DRM_SYS_PATH='$drm' CHROME_GPU=dgpu; source '$SOURCE_FILE'; chromium_gpu_override || true; echo \"GPU=\${CHROME_GPU:-}\""
@@ -545,7 +646,7 @@ write_profile() {
 
 @test "chromium_gpu_override: single GPU leaves CHROME_GPU unset" {
   local drm="$TEST_ROOT/sys/drm"
-  make_fake_drm "$drm"
+  mkdir -p "$drm"
   add_fake_card "$drm" card0 0000:13:00.0 DP-1
   run bash -c "export DRM_SYS_PATH='$drm'; source '$SOURCE_FILE'; chromium_gpu_override || true; echo \"GPU=\${CHROME_GPU:-}\""
   [[ $output == "GPU=" ]]
@@ -553,7 +654,7 @@ write_profile() {
 
 @test "apply_gpu_selection: non-hybrid with two render nodes injects no override" {
   local drm="$TEST_ROOT/sys/drm"
-  make_fake_drm "$drm"
+  mkdir -p "$drm"
   add_fake_card "$drm" card0 0000:03:00.0 DP-1
   add_fake_render_node "$drm" renderD128 0x1002 0x7550
   add_fake_render_node "$drm" renderD129 0x1002 0x164e
@@ -573,7 +674,7 @@ write_profile() {
     fi
     GPU_DEV_CREATED=1
   fi
-  make_fake_drm "$drm"
+  mkdir -p "$drm"
   add_fake_card "$drm" card0 0000:00:02.0 DP-1
   add_fake_card "$drm" card1 0000:01:00.0 HDMI-A-1
   add_fake_render_node "$drm" renderD128 0x1002 0x164e
@@ -684,10 +785,176 @@ MOCK
   [[ $output == *"invalid profile name"* ]]
 }
 
-# ── CLI guards ────────────────────────────────────────────────────────────────
+# ── install_desktop (--install) ──────────────────────────────────────────────
 
-@test "CLI: unknown --helper-* dispatch returns error" {
-  run_main --helper-bogus
+make_desktop() {
+  local f="$1" exec_val="$2"
+  cat >"$f" <<EOF
+[Desktop Entry]
+Name=Test Browser
+Exec=$exec_val
+Icon=test-browser
+EOF
+}
+
+@test "--install: rewrites Exec to wrap the binary via the wrapper" {
+  local desktop="$TEST_ROOT/brave-browser.desktop"
+  make_desktop "$desktop" "/nix/store/8mrrp4k5rjzf0w878k5yc1b789ym4m17-brave-bin-1.96.59/bin/brave-browser %U"
+  export XDG_DATA_HOME="$TEST_ROOT/data"
+  run_main --install "$desktop"
+  [[ $status -eq 0 ]]
+  local dest="$TEST_ROOT/data/applications/brave-browser.desktop"
+  [[ -f $dest ]]
+  grep -q "^Exec=$SOURCE_FILE /nix/store/8mrrp4k5rjzf0w878k5yc1b789ym4m17-brave-bin-1.96.59/bin/brave-browser %U" "$dest"
+  grep -q "^Icon=test-browser" "$dest"
+  # The original is never modified.
+  grep -q "^Exec=/nix/store/8mrrp4k5rjzf0w878k5yc1b789ym4m17-brave-bin-1.96.59/bin/brave-browser %U" "$desktop"
+}
+
+@test "--install: preserves Exec args and flags" {
+  local desktop="$TEST_ROOT/brave.desktop"
+  make_desktop "$desktop" "/usr/bin/brave-browser --flag --foo=bar %U"
+  export XDG_DATA_HOME="$TEST_ROOT/data"
+  run_main --install "$desktop"
+  [[ $status -eq 0 ]]
+  grep -q "^Exec=$SOURCE_FILE /usr/bin/brave-browser --flag --foo=bar %U" "$TEST_ROOT/data/applications/brave.desktop"
+}
+
+@test "--install: wraps each Exec= line with its own args" {
+  # The Nix store brave-browser.desktop carries several [Desktop Entry]
+  # sections, each with a different Exec= (%U, none, --incognito).
+  local desktop="$TEST_ROOT/brave-browser.desktop"
+  cat >"$desktop" <<'EOF'
+[Desktop Entry]
+Name=Brave Browser
+Exec=/nix/store/abc-brave-bin-1.0/bin/brave-browser %U
+Icon=brave
+
+[Desktop Entry]
+Name=Brave Browser (no URL)
+Exec=/nix/store/abc-brave-bin-1.0/bin/brave-browser
+Icon=brave
+
+[Desktop Entry]
+Name=Brave Browser (Incognito)
+Exec=/nix/store/abc-brave-bin-1.0/bin/brave-browser --incognito
+Icon=brave
+EOF
+  export XDG_DATA_HOME="$TEST_ROOT/data"
+  run_main --install "$desktop"
+  [[ $status -eq 0 ]]
+  local dest="$TEST_ROOT/data/applications/brave-browser.desktop"
+  [[ $(grep -c "^Exec=" "$dest") -eq 3 ]]
+  grep -q "^Exec=$SOURCE_FILE /nix/store/abc-brave-bin-1.0/bin/brave-browser %U$" "$dest"
+  grep -q "^Exec=$SOURCE_FILE /nix/store/abc-brave-bin-1.0/bin/brave-browser$" "$dest"
+  grep -q "^Exec=$SOURCE_FILE /nix/store/abc-brave-bin-1.0/bin/brave-browser --incognito$" "$dest"
+}
+
+@test "--install: special characters in Exec are preserved verbatim" {
+  local desktop="$TEST_ROOT/brave.desktop"
+  make_desktop "$desktop" "/usr/bin/brave --foo=a&b %U"
+  export XDG_DATA_HOME="$TEST_ROOT/data"
+  run_main --install "$desktop"
+  [[ $status -eq 0 ]]
+  grep -q "^Exec=$SOURCE_FILE /usr/bin/brave --foo=a&b %U$" "$TEST_ROOT/data/applications/brave.desktop"
+}
+
+@test "--install: already-wrapped Exec (abs or PATH form) is a no-op" {
+  local desktop="$TEST_ROOT/brave.desktop"
+  export XDG_DATA_HOME="$TEST_ROOT/data"
+  make_desktop "$desktop" "$SOURCE_FILE /usr/bin/brave-browser %U"
+  run_main --install "$desktop"
+  [[ $status -eq 0 ]]
+  [[ $output == *"Already wrapped"* ]]
+  make_desktop "$desktop" "chromium-wrapper /usr/bin/brave-browser %U"
+  run_main --install "$desktop"
+  [[ $status -eq 0 ]]
+  [[ $output == *"Already wrapped"* ]]
+  # A no-op writes nothing.
+  [[ ! -f $TEST_ROOT/data/applications/brave.desktop ]]
+}
+
+@test "--install: falls back to ~/.local/share when XDG_DATA_HOME is unset" {
+  local desktop="$TEST_ROOT/brave.desktop"
+  make_desktop "$desktop" "/usr/bin/brave-browser %U"
+  unset XDG_DATA_HOME
+  run_main --install "$desktop"
+  [[ $status -eq 0 ]]
+  [[ -f "$HOME/.local/share/applications/brave.desktop" ]]
+}
+
+@test "--install: missing file is fatal" {
+  run_main --install /nonexistent/nope.desktop
   [[ $status -ne 0 ]]
-  [[ $output == *"unknown helper"* ]]
+  [[ $output == *"desktop file not found"* ]]
+}
+
+@test "--install: file without Exec= is fatal" {
+  local desktop="$TEST_ROOT/noexec.desktop"
+  printf '[Desktop Entry]\nName=No Exec\n' >"$desktop"
+  run_main --install "$desktop"
+  [[ $status -ne 0 ]]
+  [[ $output == *"no Exec="* ]]
+}
+
+@test "--install: requires a file argument" {
+  run_main --install
+  [[ $status -ne 0 ]]
+  [[ $output == *"requires a .desktop file"* ]]
+}
+
+@test "--install --mode: bakes --mode into the Exec line" {
+  local desktop="$TEST_ROOT/brave-browser.desktop"
+  make_desktop "$desktop" "/nix/store/abc-brave-bin-1.0/bin/brave-browser %U"
+  export XDG_DATA_HOME="$TEST_ROOT/data"
+  run_main --mode legacy --install "$desktop"
+  [[ $status -eq 0 ]]
+  grep -q "^Exec=$SOURCE_FILE --mode legacy /nix/store/abc-brave-bin-1.0/bin/brave-browser %U" "$TEST_ROOT/data/applications/brave-browser.desktop"
+}
+
+# ── --dry-run ─────────────────────────────────────────────────────────────────
+
+@test "--dry-run: direct prints the command and does not launch" {
+  make_stub brave
+  run_main_hermetic --dry-run
+  [[ $status -eq 0 ]]
+  [[ $output == *"Would launch:"* ]]
+  [[ $output == *"$CHROMIUM_FLAGS_SCRIPT"* ]]
+  [[ $output == *"brave"* ]]
+  # No launch: the chromium-flags stub would print "chromium-flags:" if run.
+  [[ $output != *"chromium-flags:"* ]]
+}
+
+@test "--dry-run: flatpak prints the flatpak command" {
+  stub_flatpak yes
+  run_main_hermetic --dry-run
+  [[ $status -eq 0 ]]
+  [[ $output == *"Would launch: flatpak"* ]]
+  [[ $output == *"flatpak run com.brave.Browser"* ]]
+}
+
+@test "--dry-run: distrobox prints the distrobox command" {
+  stub_distrobox
+  run_main_hermetic --dry-run
+  [[ $status -eq 0 ]]
+  [[ $output == *"Would launch: distrobox-enter"* ]]
+  [[ $output == *"distrobox-enter -n bravebox -- brave-browser"* ]]
+}
+
+@test "--dry-run: explicit executable prints the wrapped command" {
+  make_stub mypathlauncher
+  local exe="$TEST_ROOT/bin/mypathlauncher"
+  run_main_hermetic --dry-run "$exe" run --brand=stable appid %U
+  [[ $status -eq 0 ]]
+  [[ $output == *"Would launch:"* ]]
+  [[ $output == *"$exe"* ]]
+  [[ $output == *"run --brand=stable appid %U"* ]]
+  [[ $output != *"chromium-flags:"* ]]
+}
+
+@test "--dry-run: no background update is started" {
+  stub_distrobox
+  run_main_hermetic --dry-run
+  [[ $status -eq 0 ]]
+  [[ $output != *"Checking for"* ]]
 }

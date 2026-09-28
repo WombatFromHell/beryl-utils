@@ -7,6 +7,7 @@
 # Profiles: ~/.config/chromium-wrapper/<profile>.conf (env: PROFILE_DIR)
 #   chromium-wrapper.sh -p brave <URL>     load profile "brave"
 #   chromium-wrapper.sh --init brave       write a template profile
+#   chromium-wrapper.sh --install FILE     wrap FILE's Exec= line (user override)
 # No profile (or missing .conf) → legacy hardcoded Brave path, with a warning.
 
 set -euo pipefail
@@ -51,11 +52,17 @@ BROWSER_BINARY="${BROWSER_BINARY:-}"
 FLATPAK_NAME="${FLATPAK_NAME:-}"
 CHROME_GPU="${CHROME_GPU:-}" # igpu|dgpu — selects render node via vulkaninfo type
 
+# --mode pins the legacy search to one path (flatpak|distrobox|legacy);
+# empty = auto (legacy > flatpak > distrobox). --dry-run prints the launch
+# command without executing (and skips background updates).
+MODE="${MODE:-}"
+DRY_RUN="${DRY_RUN:-false}"
+
 # Legacy hardcoded path (today's brave-wrapper.sh behaviour), used when no
 # profile is requested or the named .conf does not exist.
 readonly LEGACY_CONTAINER="bravebox"
 readonly LEGACY_FLATPAK_ID="com.brave.Browser"
-readonly LEGACY_CANDIDATES=(brave brave-browser-beta brave-browser)
+readonly LEGACY_CANDIDATES=(brave brave-browser brave-browser-stable brave-browser-beta)
 
 die() {
   echo "Error: $*" >&2
@@ -130,6 +137,45 @@ EOF
   die "profile already exists: $f"
 }
 
+# Wrap a .desktop file's Exec= line in this wrapper and install it as a user
+# override in $XDG_DATA_HOME/applications — the XDG user dir shadows system
+# entries of the same name, and store paths are read-only, so the original
+# file is never modified. The wrapper is referenced by absolute path: GUI/
+# portal launches have no reliable PATH.
+install_desktop() {
+  local f="${1:-}"
+  [[ -n $f ]] || die "--install requires a .desktop file path"
+  [[ -f $f ]] || die "desktop file not found: $f"
+  local exec_line rest
+  exec_line=$(grep -m1 '^Exec=' "$f") || die "no Exec= line in $f"
+  rest="${exec_line#Exec=}"
+  local wrapper="$scripts_dir/chromium-wrapper.sh"
+  if [[ ${rest%% *} == "$wrapper" || ${rest%% *} == "chromium-wrapper" ]]; then
+    echo "Already wrapped: $f"
+    return 0
+  fi
+  local dir="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+  local dest="$dir/${f##*/}"
+  mkdir -p "$dir"
+  # --mode (if set) is baked in before the original binary, pinning the
+  # search path for GUI/portal launches.
+  local prefix="$wrapper"
+  [[ -n $MODE ]] && prefix="$wrapper --mode $MODE"
+  # ponytail: bash loop, not sed — the replacement side of sed would need
+  # &/\ escaped for an arbitrary Exec value; a read loop can't be injected.
+  # Each Exec= line keeps its own args (the store file carries several:
+  # %U, none, --incognito).
+  local line
+  while IFS= read -r line || [[ -n $line ]]; do
+    if [[ $line == Exec=* ]]; then
+      printf 'Exec=%s %s\n' "$prefix" "${line#Exec=}"
+    else
+      printf '%s\n' "$line"
+    fi
+  done <"$f" >"$dest"
+  echo "Installed: $dest"
+}
+
 legacy_setup() {
   if [[ -n ${PROFILE:-} ]]; then
     echo "Warning: profile '$PROFILE' not found ($PROFILE_DIR/$PROFILE.conf) — using legacy Brave defaults (create it with: ${0##*/} --init $PROFILE)" >&2
@@ -144,46 +190,44 @@ legacy_setup() {
 
 # ── Browser resolution ───────────────────────────────────────────────────────
 
-# Legacy: flatpak first, then host candidates, then bravebox.
+# Sets BROWSER/LAUNCH_METHOD/UPDATE_METHOD/UPDATE_TARGET. Search order:
+# legacy (local PATH) > flatpak > distrobox; --mode pins to one path.
+# ponytail: `distrobox-enter` hangs when probed (blocks on terminal/tty), so
+# container existence via `distrobox ls` is the only cheap signal.
 find_browser() {
-  if is_flatpak_installed; then
-    echo "flatpak"
+  local b
+  if [[ $MODE == legacy || $MODE == "" ]]; then
+    for b in "${LEGACY_CANDIDATES[@]}"; do
+      if command -v "$b" &>/dev/null; then
+        BROWSER="$b"
+        LAUNCH_METHOD=direct
+        UPDATE_METHOD=dnf
+        UPDATE_TARGET="$b"
+        return 0
+      fi
+    done
+  fi
+  if [[ $MODE == flatpak || $MODE == "" ]] && is_flatpak_installed; then
+    BROWSER=flatpak
+    LAUNCH_METHOD=flatpak
+    UPDATE_METHOD=flatpak
+    UPDATE_TARGET="$FLATPAK_NAME"
     return 0
   fi
-  local b
-  for b in "${LEGACY_CANDIDATES[@]}"; do
-    command -v "$b" &>/dev/null && {
-      echo "$b"
-      return 0
-    }
-  done
-  # ponytail: `distrobox-enter` hangs when probed (blocks on terminal/tty),
-  # so container existence via `distrobox ls` is the only cheap signal.
-  if command -v distrobox &>/dev/null &&
+  if [[ $MODE == distrobox || $MODE == "" ]] &&
+    command -v distrobox &>/dev/null &&
     distrobox ls 2>/dev/null | grep -qw "$CONTAINER_NAME"; then
-    echo "brave-browser"
+    BROWSER=brave-browser
+    LAUNCH_METHOD=distrobox
+    UPDATE_METHOD=distrobox
+    UPDATE_TARGET=brave-browser
     return 0
   fi
   return 1
 }
 
 resolve_legacy_browser() {
-  local container=false
-  is_in_container && container=true
-  BROWSER=$(find_browser) || die "no Brave found (legacy path — try: ${0##*/} --init brave)"
-  if [[ $BROWSER == "flatpak" ]]; then
-    LAUNCH_METHOD=flatpak
-    UPDATE_METHOD=flatpak
-    UPDATE_TARGET="$FLATPAK_NAME"
-  elif [[ $container == false ]]; then
-    LAUNCH_METHOD=distrobox
-    UPDATE_METHOD=distrobox
-    UPDATE_TARGET="$BROWSER"
-  else
-    LAUNCH_METHOD=direct
-    UPDATE_METHOD=dnf
-    UPDATE_TARGET="$BROWSER"
-  fi
+  find_browser || die "no Brave found (legacy path — try: ${0##*/} --init brave)"
 }
 
 # Profile: FLATPAK_NAME → flatpak; BROWSER_BINARY on host PATH → direct;
@@ -239,16 +283,6 @@ notify() {
   [[ -z $title || -z $body ]] && return 0
   command -v notify-send &>/dev/null &&
     notify-send -a "$NOTIFY_APP" -u "$urgency" -t "$timeout" "$title" "$body" 2>/dev/null || true
-}
-
-run_command_or_fail() {
-  local cmd="$1"
-  shift
-  command -v "$cmd" &>/dev/null || {
-    echo "Error: $cmd command not found" >&2
-    return 1
-  }
-  "$@"
 }
 
 # Flatpak updates via flatpak; everything else (host dnf / distrobox) via dnf.
@@ -313,58 +347,60 @@ perform_browser_update() {
 
 # ── Launch ───────────────────────────────────────────────────────────────────
 
+# Print a command (one arg per word) for --dry-run; %q-quoting keeps the
+# output copy-paste-runnable.
+display_command() {
+  printf 'Would launch:'
+  local arg
+  for arg in "$@"; do
+    printf ' %q' "$arg"
+  done
+  printf '\n'
+}
+
 execute_launch() {
   local method="$1" browser="$2"
   shift 2
+  local -a launch_cmd=()
   case "$method" in
   flatpak)
-    run_command_or_fail flatpak "$CHROMIUM_FLAGS_SCRIPT" flatpak run "$FLATPAK_NAME" "$@"
+    launch_cmd=(flatpak "$CHROMIUM_FLAGS_SCRIPT" flatpak run "$FLATPAK_NAME" "$@")
     ;;
   distrobox)
-    run_command_or_fail distrobox-enter "$CHROMIUM_FLAGS_SCRIPT" \
-      distrobox-enter -n "$CONTAINER_NAME" -- "$browser" "$@"
+    launch_cmd=(distrobox-enter "$CHROMIUM_FLAGS_SCRIPT"
+      distrobox-enter -n "$CONTAINER_NAME" -- "$browser" "$@")
     ;;
   direct)
-    exec "$CHROMIUM_FLAGS_SCRIPT" "$browser" "$@"
+    launch_cmd=("$CHROMIUM_FLAGS_SCRIPT" "$browser" "$@")
     ;;
   esac
-}
-
-_dispatch() {
-  local cmd="$1"
-  shift
-  case "$cmd" in
-  in-container) is_in_container ;;
-  # Legacy default: the helper runs outside legacy_setup, so apply the
-  # legacy container here or the distrobox check is skipped.
-  find-browser)
-    CONTAINER_NAME="${CONTAINER_NAME:-$LEGACY_CONTAINER}"
-    find_browser
-    ;;
-  flatpak-installed) is_flatpak_installed "${1:-$FLATPAK_NAME}" ;;
-  detect-hybrid) detect_hybrid_graphics ;;
-  detect-gpu) apply_gpu_selection && printf '%s\n' "${GPU_FLAGS[@]:-}" ;;
-  notify) notify "${1:-}" "${2:-}" "${3:-}" "${4:-}" ;;
-  launch-flatpak) execute_launch flatpak flatpak "$@" ;;
-  launch-distrobox) execute_launch distrobox "${1:-brave-browser}" "${@:2}" ;;
-  launch-direct) execute_launch direct "${1:-brave-browser}" "${@:2}" ;;
-  bg-update) perform_browser_update "${1:-dnf}" "${2:-brave-browser}" ;;
-  flatpak-update-check) perform_browser_update flatpak "${1:-$LEGACY_FLATPAK_ID}" ;;
-  *)
-    die "unknown helper: $cmd"
-    ;;
-  esac
+  if [[ $DRY_RUN == true ]]; then
+    display_command "${launch_cmd[@]}"
+    return 0
+  fi
+  if [[ $method == direct ]]; then
+    exec "${launch_cmd[@]}"
+  fi
+  command -v "${launch_cmd[0]}" &>/dev/null || die "${launch_cmd[0]} not found"
+  "${launch_cmd[@]}"
 }
 
 usage() {
   cat <<EOF
-Usage: ${0##*/} [-p PROFILE] [ARGS...]     Launch a Chromium browser
+Usage: ${0##*/} [-p PROFILE] [--mode flatpak|distrobox|legacy] [--dry-run] [ARGS...]
+                Launch a Chromium browser
        ${0##*/} --init PROFILE             Write a template profile .conf
+       ${0##*/} --install FILE.desktop     Wrap FILE's Exec= line in this wrapper
+                                            (writes a user override to $XDG_DATA_HOME/applications)
        ${0##*/} EXECUTABLE [ARGS...]       Wrap an arbitrary command via chromium-flags.sh
-       ${0##*/} --helper-<name> [ARGS...]  Internal (used by tests/spawn-browser)
 
   -p PROFILE    load \$PROFILE_DIR/PROFILE.conf (env: BROWSER_PROFILE;
                 PROFILE_DIR defaults to ~/.config/chromium-wrapper)
+  --mode M      pin the legacy search to one path: flatpak, distrobox, or
+                legacy (local PATH binary). Default (no --mode): legacy >
+                flatpak > distrobox. Mutually exclusive with -p.
+  --dry-run     print the command that would launch (with GPU flags) and
+                exit; no browser, no background update.
   ARGS          passed through to the browser via chromium-flags.sh
 EOF
 }
@@ -384,6 +420,22 @@ main() {
       init_profile "${2:-}"
       return 0
       ;;
+    --install)
+      install_desktop "${2:-}"
+      return 0
+      ;;
+    --mode)
+      (($# >= 2)) || die "--mode requires a value (flatpak|distrobox|legacy)"
+      case "$2" in
+      flatpak | distrobox | legacy) MODE="$2" ;;
+      *) die "invalid --mode: $2 (expected flatpak|distrobox|legacy)" ;;
+      esac
+      shift 2
+      ;;
+    --dry-run)
+      DRY_RUN=true
+      shift
+      ;;
     -h | --help)
       usage
       return 0
@@ -397,6 +449,9 @@ main() {
   if [[ $explicit == true && -z $profile ]]; then
     die "-p requires a profile name (try: ${0##*/} --init brave)"
   fi
+  if [[ $explicit == true && $MODE != "" ]]; then
+    die "--mode and -p are mutually exclusive (profile already pins the path)"
+  fi
 
   # Explicit executable first arg (absolute path, or a name PATH-resolved like
   # `flatpak run dev.vencord.Vesktop`): wrap the whole command via
@@ -408,6 +463,10 @@ main() {
   if [[ -n $cmd ]]; then
     [[ -x $cmd ]] || die "command not executable: ${launch_args[0]}"
     apply_gpu_selection
+    if [[ $DRY_RUN == true ]]; then
+      display_command "$CHROMIUM_FLAGS_SCRIPT" "$cmd" "${launch_args[@]:1}" "${GPU_FLAGS[@]}"
+      return 0
+    fi
     exec "$CHROMIUM_FLAGS_SCRIPT" "$cmd" "${launch_args[@]:1}" "${GPU_FLAGS[@]}"
   fi
 
@@ -419,7 +478,8 @@ main() {
     resolve_legacy_browser
   fi
 
-  if [[ $LAUNCH_METHOD != "direct" ]]; then
+  # --dry-run: no side effects (no background update).
+  if [[ $DRY_RUN != true && $LAUNCH_METHOD != "direct" ]]; then
     perform_browser_update "$UPDATE_METHOD" "$UPDATE_TARGET" </dev/null &
     disown || true
   fi
@@ -429,9 +489,5 @@ main() {
 }
 
 if [[ ${BASH_SOURCE[0]} == "${0}" ]]; then
-  if [[ ${1:-} == --helper-* ]]; then
-    _dispatch "${1#--helper-}" "${@:2}"
-  else
-    main "$@"
-  fi
+  main "$@"
 fi
