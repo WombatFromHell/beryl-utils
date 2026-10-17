@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-niri_watcher.py — Track fullscreen applications in niri and fire hooks.
+wl_watcher.py — Track fullscreen applications in niri or Hyprland and fire hooks.
 
 Architecture:
     config       — Pure dataclasses / settings (no I/O at import time)
-    models       — Immutable value objects parsed from niri JSON
+    models       — Immutable value objects parsed from compositor JSON
     fetchers     — Thin I/O wrappers that return raw JSON strings
     parsers      — Pure JSON → model converters (easy to unit-test)
     evaluators   — Pure business-logic predicates (easy to unit-test)
@@ -25,35 +25,19 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field, replace
+from dataclasses import astuple, dataclass, field, replace
 from pathlib import Path
+from typing import Any
 
 # ---------------------------------------------------------------------------
 # Logging — module-level reference; handlers attached in main()
 # ---------------------------------------------------------------------------
 
-log = logging.getLogger("niri_watcher")
-
+log = logging.getLogger("wl_watcher")
 
 # ===========================================================================
 # subprocess factory — centralized process execution
 # ===========================================================================
-
-
-@dataclass(frozen=True)
-class SubprocessConfig:
-    """Configuration for subprocess execution.
-
-    Parameters
-    ----------
-    default_timeout:
-        Default timeout in seconds for blocking operations.
-    log_failures:
-        Whether to log failures at WARNING level (DEBUG for timeouts).
-    """
-
-    default_timeout: float = 5.0
-    log_failures: bool = True
 
 
 class SubprocessRunner:
@@ -71,8 +55,8 @@ class SubprocessRunner:
         runner.spawn_detached(["/path/to/hook.sh", "on"], env={...})
     """
 
-    def __init__(self, config: SubprocessConfig | None = None):
-        self.config = config or SubprocessConfig()
+    def __init__(self, default_timeout: float = 5.0):
+        self.default_timeout = default_timeout
 
     def run_text(self, args: list[str]) -> str | None:
         """Run a command and return stripped stdout, or ``None`` on failure."""
@@ -81,21 +65,18 @@ class SubprocessRunner:
                 args,
                 capture_output=True,
                 text=True,
-                timeout=self.config.default_timeout,
+                timeout=self.default_timeout,
             )
             stripped = result.stdout.strip()
             return stripped if stripped else None
         except FileNotFoundError:
-            if self.config.log_failures:
-                log.debug("Command not found: %s", args[0])
+            log.debug("Command not found: %s", args[0])
             return None
         except subprocess.TimeoutExpired:
-            if self.config.log_failures:
-                log.debug("Command timed out: %s", args[0])
+            log.debug("Command timed out: %s", args[0])
             return None
         except OSError as exc:
-            if self.config.log_failures:
-                log.warning("Command failed (%s): %s", args[0], exc)
+            log.warning("Command failed (%s): %s", args[0], exc)
             return None
 
     def run_json(self, args: list[str]) -> dict | list | None:
@@ -109,8 +90,7 @@ class SubprocessRunner:
         try:
             return json.loads(text)
         except json.JSONDecodeError:
-            if self.config.log_failures:
-                log.warning("Invalid JSON from %s", args[0])
+            log.warning("Invalid JSON from %s", args[0])
             return None
 
     def run_check(self, args: list[str]) -> bool:
@@ -123,7 +103,7 @@ class SubprocessRunner:
                 args,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                timeout=self.config.default_timeout,
+                timeout=self.default_timeout,
             )
             return result.returncode == 0
         except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
@@ -141,8 +121,7 @@ class SubprocessRunner:
         """
         cmd = args[0]
         if not shutil.which(cmd) and not Path(cmd).is_file():
-            if self.config.log_failures:
-                log.warning("Command not found/executable: %s", cmd)
+            log.warning("Command not found/executable: %s", cmd)
             return None
         try:
             proc = subprocess.Popen(
@@ -154,8 +133,7 @@ class SubprocessRunner:
             log.info("Spawned: %s", " ".join(args))
             return proc
         except OSError as exc:
-            if self.config.log_failures:
-                log.warning("Spawn failed (%s): %s", cmd, exc)
+            log.warning("Spawn failed (%s): %s", cmd, exc)
             return None
 
 
@@ -288,6 +266,12 @@ DEFAULT_INCLUDED_APPS: frozenset[AppFilter] = frozenset(
     {AppFilter("steam", "Steam Big Picture Mode")}
 )
 
+#: Apps that keep VRR off on their output while fullscreen, even when they
+#: are (or because they are) detected fullscreen.  Off wins over VRR_ON.
+DEFAULT_VRR_OFF_APPS: frozenset[AppFilter] = frozenset(
+    {AppFilter("steam", "Steam Big Picture Mode")}
+)
+
 
 # ===========================================================================
 # config — immutable settings, no I/O at import time
@@ -303,7 +287,7 @@ class Config:
     """
 
     poll_interval: float = 2.0
-    log_file: Path = Path("/tmp/niri_watcher.log")
+    log_file: Path = Path("/tmp/wl_watcher.log")
     startup_delay: float = 3.0
     debug_mode: bool = False
     hook_on: list[str] = field(default_factory=list)
@@ -312,6 +296,9 @@ class Config:
     excluded_apps: frozenset[AppFilter] = field(default_factory=frozenset)
     #: User-defined inclusions from ``WATCHER_INCLUDED_APPS`` (highest priority).
     included_apps: frozenset[AppFilter] = field(default_factory=frozenset)
+    #: Per-app VRR intent: pin these apps VRR-off / VRR-on on their output.
+    vrr_off_apps: frozenset[AppFilter] = field(default_factory=frozenset)
+    vrr_on_apps: frozenset[AppFilter] = field(default_factory=frozenset)
     relaxed_mode: bool = False
     hold_mode: bool = True
     #: Compositor backend, auto-detected at startup ("niri" or "hyprland").
@@ -331,7 +318,7 @@ class Config:
             log_file=Path(
                 os.environ.get(
                     "WATCHER_LOG_FILE",
-                    f"{runtime_dir}/niri_watcher.log",
+                    f"{runtime_dir}/wl_watcher.log",
                 )
             ),
             startup_delay=float(os.environ.get("WATCHER_STARTUP_DELAY", "3")),
@@ -343,6 +330,12 @@ class Config:
             ),
             included_apps=_parse_app_filter_list(
                 os.environ.get("WATCHER_INCLUDED_APPS", "")
+            ),
+            vrr_off_apps=_parse_app_filter_list(
+                os.environ.get("WATCHER_VRR_OFF_APPS", "")
+            ),
+            vrr_on_apps=_parse_app_filter_list(
+                os.environ.get("WATCHER_VRR_ON_APPS", "")
             ),
             relaxed_mode=os.environ.get("WATCHER_RELAXED_MODE", "0") == "1",
             hold_mode=os.environ.get("WATCHER_HOLD_MODE", "1") != "0",
@@ -689,6 +682,17 @@ def _physical_to_logical(width: int, height: int, scale: float) -> tuple[int, in
     return int(width / scale), int(height / scale)
 
 
+def _load_json(raw: str | None, label: str, default: Any) -> Any:
+    """Parse a fetcher payload; return ``default`` when it is absent or malformed."""
+    if not raw:
+        return default
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        log.warning("Failed to parse %s JSON", label)
+        return default
+
+
 def parse_outputs(outputs_json: str | None) -> dict[str, OutputInfo]:
     """
     Parse niri outputs JSON (object keyed by output name).
@@ -704,16 +708,10 @@ def parse_outputs(outputs_json: str | None) -> dict[str, OutputInfo]:
     The stored ``width``/``height`` are the logical resolution (physical / scale),
     so that ``physical_resolution`` correctly returns the actual pixel dimensions.
     """
-    if not outputs_json:
-        return {}
-    try:
-        data: dict = json.loads(outputs_json)
-    except json.JSONDecodeError:
-        log.warning("Failed to parse outputs JSON")
-        return {}
+    outputs_payload = _load_json(outputs_json, "outputs", {})
 
     result: dict[str, OutputInfo] = {}
-    for name, info in data.items():
+    for name, info in outputs_payload.items():
         modes = info.get("modes", [])
         current_idx = info.get("current_mode")
 
@@ -752,16 +750,10 @@ def parse_workspaces(workspaces_json: str | None) -> dict[int, str]:
     Parse niri workspaces JSON (array).
     Returns {workspace_id: output_name}.
     """
-    if not workspaces_json:
-        return {}
-    try:
-        data: list = json.loads(workspaces_json)
-    except json.JSONDecodeError:
-        log.warning("Failed to parse workspaces JSON")
-        return {}
+    workspaces_payload = _load_json(workspaces_json, "workspaces", {})
 
     result: dict[int, str] = {}
-    for ws in data:
+    for ws in workspaces_payload:
         ws_id = ws.get("id")
         output = ws.get("output", "")
         if ws_id is not None and output:
@@ -782,16 +774,10 @@ def parse_windows(windows_json: str | None) -> list[WindowInfo]:
         except (TypeError, ValueError):
             return None
 
-    if not windows_json:
-        return []
-    try:
-        data: list = json.loads(windows_json)
-    except json.JSONDecodeError:
-        log.warning("Failed to parse windows JSON")
-        return []
+    windows_payload = _load_json(windows_json, "windows", [])
 
     windows: list[WindowInfo] = []
-    for win in data:
+    for win in windows_payload:
         layout = win.get("layout", {})
         tile_size = layout.get("tile_size") or []
         win_size = layout.get("window_size") or []
@@ -820,16 +806,10 @@ def parse_hyprland_outputs(monitors_json: str | None) -> dict[str, OutputInfo]:
     via the shared ``_physical_to_logical`` helper (same as niri).
     ``disabled`` is a bool (there is no ``active`` key in hyprctl).
     """
-    if not monitors_json:
-        return {}
-    try:
-        data: list = json.loads(monitors_json)
-    except json.JSONDecodeError:
-        log.warning("Failed to parse monitors JSON")
-        return {}
+    monitors_payload = _load_json(monitors_json, "monitors", {})
 
     result: dict[str, OutputInfo] = {}
-    for m in data:
+    for m in monitors_payload:
         name = m.get("name")
         if not name:
             continue
@@ -852,16 +832,10 @@ def parse_hyprland_workspaces(workspaces_json: str | None) -> dict[int, str]:
 
     Hyprland's ``monitor`` field is the output-name string (e.g. "DP-1").
     """
-    if not workspaces_json:
-        return {}
-    try:
-        data: list = json.loads(workspaces_json)
-    except json.JSONDecodeError:
-        log.warning("Failed to parse workspaces JSON")
-        return {}
+    workspaces_payload = _load_json(workspaces_json, "workspaces", {})
 
     result: dict[int, str] = {}
-    for ws in data:
+    for ws in workspaces_payload:
         ws_id = ws.get("id")
         monitor = ws.get("monitor")
         if ws_id is not None and monitor:
@@ -871,16 +845,10 @@ def parse_hyprland_workspaces(workspaces_json: str | None) -> dict[int, str]:
 
 def parse_hyprland_windows(clients_json: str | None) -> list[WindowInfo]:
     """Parse ``hyprctl clients -j`` (array). Returns list[WindowInfo]."""
-    if not clients_json:
-        return []
-    try:
-        data: list = json.loads(clients_json)
-    except json.JSONDecodeError:
-        log.warning("Failed to parse clients JSON")
-        return []
+    clients_payload = _load_json(clients_json, "clients", [])
 
     windows: list[WindowInfo] = []
-    for c in data:
+    for c in clients_payload:
         size = c.get("size") or [None, None]
         ws = c.get("workspace") or {}
         # ponytail: hyprctl fullscreen_state_internal (Hyprland >=0.55) is an
@@ -925,13 +893,17 @@ class EvalContext:
 
     Built-in inclusion/exclusion (``DEFAULT_INCLUDED_APPS`` /
     ``DEFAULT_EXCLUDED_APPS``) are module constants, not per-cycle state,
-    so they are referenced directly rather than threaded through here.
+    so they are referenced directly rather than threaded through here.  The
+    per-app VRR intent (``vrr_off_apps`` / ``vrr_on_apps``) *is* per-cycle
+    state, so it lives here.
     """
 
     ws_to_output: dict[int, str]
     outputs: dict[str, OutputInfo]
     excluded_apps: frozenset[AppFilter] = field(default_factory=frozenset)
     included_apps: frozenset[AppFilter] = field(default_factory=frozenset)
+    vrr_off_apps: frozenset[AppFilter] = field(default_factory=frozenset)
+    vrr_on_apps: frozenset[AppFilter] = field(default_factory=frozenset)
     relaxed_mode: bool = False
 
 
@@ -1094,23 +1066,49 @@ def window_is_fullscreen_and_active(
     return output
 
 
-def compute_desired_fullscreen(
+def compute_desired_vrr(
     windows: list[WindowInfo],
     ctx: EvalContext,
     *,
     gpu_pids: set[int] | None = None,
 ) -> dict[str, bool]:
     """
-    Return {output_name: has_fullscreen_app} for all known outputs.
+    Return {output_name: fire_vrr_on} for all known outputs.
+
+    The firing decision is the fullscreen default (on when something is
+    fullscreen, off when not), overridden by the per-app VRR intent with
+    off winning over on:
+      - VRR_OFF (user + default) forces the output off.
+      - VRR_ON forces it on.
 
     Pure function — deterministic given its inputs.
     """
-    desired = {name: False for name in ctx.outputs}
+    vrr_off_rules = ctx.vrr_off_apps | DEFAULT_VRR_OFF_APPS
+    vrr_on_rules = ctx.vrr_on_apps
+
+    present: set[str] = set()
+    forced_off: set[str] = set()
+    forced_on: set[str] = set()
 
     for window in windows:
         output = window_is_fullscreen_and_active(window, ctx, gpu_pids=gpu_pids)
-        if output is not None:
-            desired[output.name] = True
+        if output is None:
+            continue
+        name = output.name
+        present.add(name)
+        if is_app_included(window.app_id, vrr_off_rules, title=window.title):
+            forced_off.add(name)
+        elif is_app_included(window.app_id, vrr_on_rules, title=window.title):
+            forced_on.add(name)
+
+    desired: dict[str, bool] = {}
+    for name in ctx.outputs:
+        if name in forced_off:
+            desired[name] = False
+        elif name in forced_on:
+            desired[name] = True
+        else:
+            desired[name] = name in present
 
     return desired
 
@@ -1124,6 +1122,9 @@ def execute_hook(
     hook_spec: str,
     output_name: str,
     app_pid: int | None = None,
+    app_id: str | None = None,
+    app_title: str | None = None,
+    vrr_state: str | None = None,
 ) -> None:
     """Execute a hook command asynchronously. Failures are logged, not raised."""
     if not hook_spec:
@@ -1134,6 +1135,9 @@ def execute_hook(
         **os.environ,
         "WATCHER_OUTPUT_NAME": output_name,
         "WATCHER_APP_PID": str(app_pid) if app_pid is not None else "",
+        "WATCHER_APP_ID": app_id or "",
+        "WATCHER_APP_TITLE": app_title or "",
+        "WATCHER_VRR": vrr_state or "",
     }
     result = _default_runner.spawn_detached([cmd, *args], env=env)
     if result is not None:
@@ -1240,20 +1244,10 @@ class HoldPIDTracker:
     _pids: dict[str, int] = field(default_factory=dict)  # output_name → pid
     _pid_to_output: dict[int, str] = field(default_factory=dict)  # reverse index
 
-    def _link(self, pid: int, output_name: str) -> None:
-        """Link a PID to an output name in both indexes."""
+    def record(self, pid: int, output_name: str) -> None:
+        """Link an output to the PID of the included app holding it."""
         self._pids[output_name] = pid
         self._pid_to_output[pid] = output_name
-
-    def _unlink(self, output_name: str) -> None:
-        """Remove an output from both indexes."""
-        pid = self._pids.pop(output_name, None)
-        if pid is not None:
-            self._pid_to_output.pop(pid, None)
-
-    def record(self, pid: int, output_name: str) -> None:
-        """Record a PID for the given output."""
-        self._link(pid, output_name)
 
     def has_running_pid(self, pid: int) -> bool:
         """Return True if the PID is recorded and still alive."""
@@ -1269,27 +1263,36 @@ class HoldPIDTracker:
             return False
         return is_process_alive(pid)
 
+    def alive_pids(self) -> tuple[int, ...]:
+        """Tracked PIDs that are still running, sorted for a stable signature."""
+        return tuple(
+            sorted(pid for pid in self._pids.values() if is_process_alive(pid))
+        )
+
     def evict_dead_pids(self) -> None:
         """Remove all recorded PIDs that are no longer alive."""
         for name in [n for n, p in self._pids.items() if not is_process_alive(p)]:
-            self._unlink(name)
+            self.clear_output(name)
 
     def evict_missing_pids(self, present_pids: set[int]) -> None:
         """Remove recorded PIDs that no longer appear in the compositor window list."""
         for name in [n for n, p in self._pids.items() if p not in present_pids]:
-            self._unlink(name)
+            self.clear_output(name)
 
     def evict_non_matching_pids(self, valid_pids: set[int]) -> None:
         """Remove recorded PIDs that are no longer in the valid set."""
         for name in [n for n, p in self._pids.items() if p not in valid_pids]:
-            self._unlink(name)
+            self.clear_output(name)
 
     def clear(self) -> None:
         self._pids.clear()
         self._pid_to_output.clear()
 
     def clear_output(self, output_name: str) -> None:
-        self._unlink(output_name)
+        """Drop one output from both indexes."""
+        pid = self._pids.pop(output_name, None)
+        if pid is not None:
+            self._pid_to_output.pop(pid, None)
 
 
 # ===========================================================================
@@ -1311,7 +1314,7 @@ class VrrOrchestrator:
         fetch_windows: Callable[[], str] = fetch_niri_windows,
         fetch_workspaces: Callable[[], str] = fetch_niri_workspaces,
         fetch_gpu_pids: Callable[[], list[int]] = fetch_gpu_pids,
-        run_hook: Callable[[str, str, int | None], None] = execute_hook,
+        run_hook: Callable[..., None] = execute_hook,
         parse_outputs_fn: Callable[[str | None], dict[str, OutputInfo]] = parse_outputs,
         parse_windows_fn: Callable[[str | None], list[WindowInfo]] = parse_windows,
         parse_workspaces_fn: Callable[[str | None], dict[int, str]] = parse_workspaces,
@@ -1332,17 +1335,6 @@ class VrrOrchestrator:
         self._last_cycle_hash: int | None = None
 
     # ------------------------------------------------------------------
-    # Phase 1: Collect
-    # ------------------------------------------------------------------
-
-    def _collect(self) -> tuple[str, str, str]:
-        return (
-            self._fetch_outputs(),
-            self._fetch_windows(),
-            self._fetch_workspaces(),
-        )
-
-    # ------------------------------------------------------------------
     # Stable hash (excludes volatile fields like focus_timestamp)
     # ------------------------------------------------------------------
 
@@ -1351,29 +1343,22 @@ class VrrOrchestrator:
         outputs_json: str,
         windows: list[WindowInfo],
         ws_to_output: dict[int, str],
+        held_pids: tuple[int, ...],
     ) -> int:
         """Hash the cycle state, ignoring volatile fields (focus_timestamp).
 
-        Windows are hashed via their consumed fields only; outputs_json is
+        Windows are hashed as their full ``WindowInfo`` value (the model already
+        drops volatile payload fields such as focus_timestamp); outputs_json is
         hashed raw (it has no volatile fields); workspaces as sorted tuples.
+
+        ``held_pids`` carries hold-mode's out-of-band input: process liveness
+        comes from /proc, not from the compositor payload, so a held PID can
+        exit while every payload field stays identical. Without it in the key,
+        a skipped cycle would leave HOOK_OFF un-fired forever.
         """
-        windows_key = tuple(
-            (
-                w.app_id,
-                w.pid,
-                w.workspace_id,
-                w.tile_w,
-                w.tile_h,
-                w.win_w,
-                w.win_h,
-                w.is_focused,
-                w.title,
-                w.fullscreen,
-            )
-            for w in windows
-        )
+        windows_key = tuple(map(astuple, windows))
         ws_key = tuple(sorted(ws_to_output.items()))
-        return hash((outputs_json, windows_key, ws_key))
+        return hash((outputs_json, windows_key, ws_key, held_pids))
 
     # ------------------------------------------------------------------
     # Phase 2: Parse  (delegates to pure parsers)
@@ -1427,16 +1412,18 @@ class VrrOrchestrator:
             outputs=outputs,
             excluded_apps=self.config.excluded_apps,
             included_apps=self.config.included_apps,
+            vrr_off_apps=self.config.vrr_off_apps,
+            vrr_on_apps=self.config.vrr_on_apps,
             relaxed_mode=self.config.relaxed_mode,
         )
-        desired = compute_desired_fullscreen(windows, ctx, gpu_pids=gpu_pids)
+        desired = compute_desired_vrr(windows, ctx, gpu_pids=gpu_pids)
 
         # Evict hold-mode entries for windows that no longer match inclusion
         # rules (e.g. Steam BPM title changed to something else).
         still_included_pids: set[int] = {
             w.pid
             for w in windows
-            if w.pid is not None and self._is_included_app(w.app_id, ctx, title=w.title)
+            if w.pid is not None and _app_is_included(w.app_id, ctx, title=w.title)
         }
         self._hold_pid_tracker.evict_non_matching_pids(still_included_pids)
 
@@ -1491,7 +1478,7 @@ class VrrOrchestrator:
                     )
 
             # Record PID for hold mode if it's an included app
-            if window.pid is not None and self._is_included_app(
+            if window.pid is not None and _app_is_included(
                 window.app_id, ctx, title=window.title
             ):
                 already_tracked = self._hold_pid_tracker.is_output_held(output.name)
@@ -1503,16 +1490,6 @@ class VrrOrchestrator:
                         window.app_id,
                         output.name,
                     )
-
-    @staticmethod
-    def _is_included_app(
-        app_id: str,
-        ctx: EvalContext,
-        *,
-        title: str | None = None,
-    ) -> bool:
-        """Return True if the app matches user or default inclusion rules."""
-        return _app_is_included(app_id, ctx, title=title)
 
     # ------------------------------------------------------------------
     # Phase 4: Act
@@ -1570,37 +1547,40 @@ class VrrOrchestrator:
         """Run on/off hooks for completed fullscreen transitions."""
         for output_name, want_on in transitions:
             hooks = self.config.hook_on if want_on else self.config.hook_off
+            pid, app_id, app_title = self._focused_window(
+                output_name, windows, ws_to_output
+            )
+            vrr_state = "on" if want_on else "off"
             for spec in hooks:
-                pid = self._focused_window_pid(output_name, windows, ws_to_output)
-                self._run_hook(spec, output_name, pid)
+                self._run_hook(spec, output_name, pid, app_id, app_title, vrr_state)
             if not want_on:
                 self._app_tracker.clear(output_name)
 
     @staticmethod
-    def _focused_window_pid(
+    def _focused_window(
         output_name: str,
         windows: list[WindowInfo],
         ws_to_output: dict[int, str],
-    ) -> int | None:
-        """Return the PID of the focused window on the given output."""
+    ) -> tuple[int | None, str | None, str | None]:
+        """Return (pid, app_id, title) of the focused window on the given output."""
         for window in windows:
             if window.is_focused and window.workspace_id is not None:
                 if ws_to_output.get(window.workspace_id) == output_name:
-                    return window.pid
-        return None
+                    return (window.pid, window.app_id, window.title)
+        return (None, None, None)
 
     def _cleanup_stale_outputs(self, known_outputs: set[str]) -> None:
         """Remove state for outputs that disappeared."""
-        for gone in self._fullscreen_state.all_tracked() - known_outputs:
+        stale_outputs = self._fullscreen_state.all_tracked() - known_outputs
+        for gone in stale_outputs:
             log.info("Output %s disconnected, cleaning state", gone)
             self._fullscreen_state.clear(gone)
             self._app_tracker.clear(gone)
             self._hold_pid_tracker.clear_output(gone)
-        # Clear PID cache when outputs change (focus context may have shifted)
-        if self._fullscreen_state.all_tracked() - known_outputs:
+        if stale_outputs:
+            # Focus context may have shifted with the outputs.
             self._pid_cache.clear()
 
-        # Evict dead PIDs from hold tracker
         self._hold_pid_tracker.evict_dead_pids()
 
     def _act(
@@ -1619,13 +1599,17 @@ class VrrOrchestrator:
     # ------------------------------------------------------------------
 
     def poll_once(self) -> None:
-        outputs_json, windows_json, workspaces_json = self._collect()
+        outputs_json = self._fetch_outputs()
+        windows_json = self._fetch_windows()
+        workspaces_json = self._fetch_workspaces()
         outputs, windows, ws_to_output = self._parse(
             outputs_json, windows_json, workspaces_json
         )
 
         # Content-hash skip: if nothing changed, skip _decide() and _act()
-        cycle_hash = self._stable_cycle_hash(outputs_json, windows, ws_to_output)
+        cycle_hash = self._stable_cycle_hash(
+            outputs_json, windows, ws_to_output, self._hold_pid_tracker.alive_pids()
+        )
         if cycle_hash == self._last_cycle_hash:
             log.debug("No state change detected, skipping cycle")
             return
@@ -1666,15 +1650,18 @@ class VrrOrchestrator:
         cycle will handle failure gracefully.
         """
         proc = "Hyprland" if self.config.backend == "hyprland" else "niri"
-        deadline = time.monotonic() + self.config.startup_delay
+        start = time.monotonic()
+        deadline = start + self.config.startup_delay
         attempt = 0
         while time.monotonic() < deadline:
             attempt += 1
             if _default_runner.run_check(["pgrep", "-x", proc]):
                 if attempt > 1:
-                    elapsed = time.monotonic() - (deadline - self.config.startup_delay)
                     log.info(
-                        "%s ready after %.1fs (attempt %d)", proc, elapsed, attempt
+                        "%s ready after %.1fs (attempt %d)",
+                        proc,
+                        time.monotonic() - start,
+                        attempt,
                     )
                 return
             if attempt == 1:
@@ -1734,16 +1721,12 @@ class VrrOrchestrator:
 
 
 def check_dependencies(backend: str = "niri") -> bool:
-    missing: list[str] = []
-    required = ["hyprctl"] if backend == "hyprland" else ["niri"]
-    for cmd in required:
-        if not shutil.which(cmd):
-            missing.append(cmd)
-    if missing:
-        log.error("Missing required commands: %s", ", ".join(missing))
-        print(f"Error: Missing: {', '.join(missing)}", file=sys.stderr)
-        return False
-    return True
+    compositor = "hyprctl" if backend == "hyprland" else "niri"
+    if shutil.which(compositor):
+        return True
+    log.error("Missing required command: %s", compositor)
+    print(f"Error: Missing: {compositor}", file=sys.stderr)
+    return False
 
 
 # ===========================================================================
@@ -1757,7 +1740,7 @@ def _configure_logging(
     *,
     service_mode: bool = False,
 ) -> None:
-    """Attach handlers to the module-level ``niri_vrr`` logger.
+    """Attach handlers to the module-level ``wl_watcher`` logger.
 
     Parameters
     ----------
@@ -1771,7 +1754,7 @@ def _configure_logging(
         the journal — no ``python3-systemd`` package needed.
     """
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    logger = logging.getLogger("niri_watcher")
+    logger = logging.getLogger("wl_watcher")
     logger.setLevel(logging.DEBUG if debug else logging.INFO)
 
     # Clear stale handlers (important for re-configuration in tests)
@@ -1806,7 +1789,7 @@ def _detect_systemd_service() -> bool:
 def print_help() -> None:
     """Print comprehensive usage information."""
     help_text = """\
-Usage: niri_watcher.py [OPTIONS]
+Usage: wl_watcher.py [OPTIONS]
 
 Track fullscreen applications in niri or Hyprland and fire hooks when they
 enter or exit fullscreen mode.  Designed for per-output variable refresh
@@ -1826,7 +1809,7 @@ ENVIRONMENT VARIABLES
     WATCHER_STARTUP_DELAY     float   Seconds to wait before first poll.
                                           Default: 3
     WATCHER_LOG_FILE          path    Log file location.
-                                          Default: $XDG_RUNTIME_DIR/niri_watcher.log
+                                          Default: $XDG_RUNTIME_DIR/wl_watcher.log
 
   Logging
     WATCHER_DEBUG             0|1     Enable DEBUG-level logging.
@@ -1838,8 +1821,9 @@ ENVIRONMENT VARIABLES
   Hooks
     WATCHER_HOOK_ON           str     Colon-separated command(s) to run when
                                         a fullscreen app is detected.
-                                        Receives WATCHER_OUTPUT_NAME and
-                                        WATCHER_APP_PID in the environment.
+                                        Receives WATCHER_OUTPUT_NAME, WATCHER_APP_PID,
+                                        WATCHER_APP_ID, WATCHER_APP_TITLE, and
+                                        WATCHER_VRR (on|off) in the environment.
                                             Default: (none)
     WATCHER_HOOK_OFF          str     Colon-separated command(s) to run when
                                       fullscreen app exits.
@@ -1866,6 +1850,21 @@ ENVIRONMENT VARIABLES
                                           Default: (none)
 
     Built-in included:
+      steam,Steam Big Picture Mode
+
+    Per-app VRR intent (same filter format as above).  These override the
+    default "fullscreen means VRR on" rule, off wins over on, and they never
+    change fullscreen detection itself:
+
+    WATCHER_VRR_OFF_APPS      str     Pin VRR OFF on these apps' output while
+                                      they are fullscreen (e.g. a desktop shell
+                                      that wants the display left alone).
+                                          Default: (none)
+
+    WATCHER_VRR_ON_APPS       str     Pin VRR ON for these apps' output.
+                                          Default: (none)
+
+    Built-in VRR-off:
       steam,Steam Big Picture Mode
 
     Built-in excluded:
@@ -1895,27 +1894,27 @@ EXAMPLES
 
     export WATCHER_HOOK_ON="ksuperkey -e 'vrr on'"
     export WATCHER_HOOK_OFF="ksuperkey -e 'vrr off'"
-    niri_watcher.py
+    wl_watcher.py
 
   Include custom apps with glob title matching:
 
     export WATCHER_INCLUDED_APPS="wine.exe,*Game*;wine-staging,"
-    niri_watcher.py
+    wl_watcher.py
 
   Exclude a specific app:
 
     export WATCHER_EXCLUDED_APPS="com.mitchellh.ghostty"
-    niri_watcher.py
+    wl_watcher.py
 
   Relaxed mode (no nvtop required):
 
     export WATCHER_RELAXED_MODE=1
-    niri_watcher.py
+    wl_watcher.py
 
   Disable hold mode (always fire hook_off when fullscreen ends):
 
     export WATCHER_HOLD_MODE=0
-    niri_watcher.py
+    wl_watcher.py
 
 REQUIREMENTS
   niri        The niri Wayland compositor (must be running), OR
@@ -2008,7 +2007,7 @@ def main() -> None:
         sys.exit(0)
 
     if "--version" in sys.argv:
-        print("niri_watcher.py 1.0.0")
+        print("wl_watcher.py 1.0.0")
         sys.exit(0)
 
     config = Config.from_env()

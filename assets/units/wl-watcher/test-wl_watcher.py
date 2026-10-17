@@ -8,6 +8,7 @@ callables so no real compositor/nvtop is touched.
 
 from __future__ import annotations
 
+import json
 import os
 from unittest.mock import MagicMock
 
@@ -57,7 +58,7 @@ def make_ctx(outputs=None, ws_to_output=None, **overrides) -> nw.EvalContext:
     return nw.EvalContext(**base)
 
 
-def fs_window(output="DP-1", **kw) -> nw.WindowInfo:
+def fs_window(**kw) -> nw.WindowInfo:
     """A window that geometrically fills the default 1920x1080 output."""
     kw.setdefault("app_id", "mygame")  # not in default excluded/included
     kw.setdefault("workspace_id", 1)
@@ -176,26 +177,40 @@ class TestParseHyprlandOutputs:
         assert out.resolution == (1920, 1080)
 
 
+def hypr_window_payload(fullscreen=None, workspace_id=1, focus_history=0) -> str:
+    """One hyprctl window payload; ``fullscreen`` is the raw int hyprctl
+    reports (None omits that key)."""
+    window = {
+        "class": "mpv",
+        "pid": 1,
+        "size": [1, 1],
+        "workspace": {"id": workspace_id},
+        "focusHistoryID": focus_history,
+    }
+    if fullscreen is not None:
+        window["fullscreen"] = fullscreen
+    return json.dumps([window])
+
+
 class TestParseHyprlandWindows:
-    # ponytail: hyprctl fullscreen is an int; bit1 is the fullscreen bit.
     @pytest.mark.parametrize(
-        "fs_state,expect",
+        "fullscreen,expect",
         [(0, False), (1, False), (2, True), (3, True)],
     )
-    def test_fullscreen_bit(self, fs_state, expect):
-        data = f'[{{"class":"mpv","pid":1,"size":[100,100],"workspace":{{"id":1}},"focusHistoryID":0,"fullscreen":{fs_state}}}]'
-        w = nw.parse_hyprland_windows(data)[0]
-        assert w.fullscreen is expect
+    def test_fullscreen_bit(self, fullscreen, expect):
+        payload = hypr_window_payload(fullscreen=fullscreen)
+        window = nw.parse_hyprland_windows(payload)[0]
+        assert window.fullscreen is expect
 
     def test_focus_via_focus_history_zero(self):
-        data = '[{"class":"mpv","pid":1,"size":[1,1],"workspace":{"id":1},"focusHistoryID":0}]'
-        assert nw.parse_hyprland_windows(data)[0].is_focused
-        data2 = data.replace('"focusHistoryID":0', '"focusHistoryID":3')
-        assert not nw.parse_hyprland_windows(data2)[0].is_focused
+        focused = nw.parse_hyprland_windows(hypr_window_payload())[0]
+        assert focused.is_focused
+        unfocused = nw.parse_hyprland_windows(hypr_window_payload(focus_history=3))[0]
+        assert not unfocused.is_focused
 
     def test_workspace_id_from_nested(self):
-        data = '[{"class":"mpv","pid":1,"size":[1,1],"workspace":{"id":7},"focusHistoryID":0}]'
-        assert nw.parse_hyprland_windows(data)[0].workspace_id == 7
+        window = nw.parse_hyprland_windows(hypr_window_payload(workspace_id=7))[0]
+        assert window.workspace_id == 7
 
 
 class TestParseHyprlandWorkspaces:
@@ -305,11 +320,6 @@ class TestAppFilterPriority:
                 dict(excluded_apps=frozenset({nw.AppFilter("mpv")})),
                 None,
             ),
-            # user-included (unfocused) still detected
-            (
-                dict(included_apps=frozenset({nw.AppFilter("mpv")})),
-                "DP-1",
-            ),
         ],
     )
     def test_priority(self, ctx_kw, expect):
@@ -329,8 +339,45 @@ class TestComputeDesired:
             fs_window(workspace_id=1, app_id="mygame"),
             fs_window(workspace_id=2, app_id="mygame", is_focused=False),
         ]
-        desired = nw.compute_desired_fullscreen(windows, ctx)
+        desired = nw.compute_desired_vrr(windows, ctx)
         assert desired == {"DP-1": True, "HDMI-1": False}
+
+    @pytest.mark.parametrize(
+        "windows,ctx_kw,expect_dp1",
+        [
+            # default VRR-off pins steam BPM off even while fullscreen
+            (
+                [fs_window(app_id="steam", title="Steam Big Picture Mode")],
+                {},
+                False,
+            ),
+            # off wins: an ordinary game and pinned-off steam share an output
+            (
+                [
+                    fs_window(app_id="mygame"),
+                    fs_window(app_id="steam", title="Steam Big Picture Mode"),
+                ],
+                {},
+                False,
+            ),
+            # user VRR-off pins an ordinary game off
+            (
+                [fs_window(app_id="mygame")],
+                {"vrr_off_apps": frozenset({nw.AppFilter("mygame")})},
+                False,
+            ),
+            # user VRR-on pins an ordinary game on
+            (
+                [fs_window(app_id="mygame")],
+                {"vrr_on_apps": frozenset({nw.AppFilter("mygame")})},
+                True,
+            ),
+        ],
+    )
+    def test_vrr_intent(self, windows, ctx_kw, expect_dp1):
+        ctx = make_ctx(**ctx_kw)
+        desired = nw.compute_desired_vrr(windows, ctx, gpu_pids=None)
+        assert desired["DP-1"] is expect_dp1
 
 
 # ===========================================================================
@@ -442,30 +489,41 @@ class TestOrchestratorTransitions:
 
 class TestHoldMode:
     def test_hook_off_suppressed_while_pid_alive(self):
-        # steam BPM is default-included; its PID stays alive (os.getpid()).
-        cfg = nw.Config(hook_on=["on.sh"], hook_off=["off.sh"], relaxed_mode=True)
-        win = niri_windows_payload(app_id="steam", w=1920, h=1080).replace(
-            '"title":"t"', '"title":"Steam Big Picture Mode"'
+        # A user-included app that is not VRR-pinned keeps hold mode: its
+        # window leaving fullscreen does not fire HOOK_OFF while the PID lives.
+        cfg = nw.Config(
+            hook_on=["on.sh"],
+            hook_off=["off.sh"],
+            relaxed_mode=True,
+            included_apps=frozenset({nw.AppFilter("myholdapp")}),
         )
-        orch, state = orch_with_state(cfg, windows=win)
+        orch, state = orch_with_state(
+            cfg, windows=niri_windows_payload(app_id="myholdapp", w=1920, h=1080)
+        )
         orch.poll_once()  # turns on, records hold PID
-        # Window still present (so hold PID not evicted) but no longer
-        # fullscreen -> off would fire, but hold mode suppresses it.
-        present = niri_windows_payload(app_id="steam", w=800, h=600).replace(
-            '"title":"t"', '"title":"Steam Big Picture Mode"'
-        )
+        present = niri_windows_payload(app_id="myholdapp", w=800, h=600)
         state["windows"] = present
         orch.poll_once()
         orch._run_hook.assert_called_once()  # only the "on" call; off suppressed
 
 
-class TestFocusedWindowPid:
-    def test_finds_pid_on_output(self):
+class TestFocusedWindow:
+    def test_finds_pid_and_identity(self):
         ctx = make_ctx(ws_to_output={1: "DP-1"})
-        w = make_window(workspace_id=1, pid=1234)
-        assert (
-            nw.VrrOrchestrator._focused_window_pid("DP-1", [w], ctx.ws_to_output)
-            == 1234
+        w = make_window(workspace_id=1, pid=1234, app_id="mygame")
+        assert nw.VrrOrchestrator._focused_window("DP-1", [w], ctx.ws_to_output) == (
+            1234,
+            "mygame",
+            None,
+        )
+
+    def test_no_focused_window(self):
+        ctx = make_ctx(ws_to_output={1: "DP-1"})
+        w = make_window(workspace_id=1, pid=1234, is_focused=False)
+        assert nw.VrrOrchestrator._focused_window("DP-1", [w], ctx.ws_to_output) == (
+            None,
+            None,
+            None,
         )
 
 
@@ -517,11 +575,14 @@ class _FakeRunner:
 def test_execute_hook_sets_env(monkeypatch):
     fake = _FakeRunner()
     monkeypatch.setattr(nw, "_default_runner", fake)
-    nw.execute_hook("echo hi", "DP-1", 4242)
+    nw.execute_hook("echo hi", "DP-1", 4242, "mygame", "Level 1", "on")
     args, env = fake.calls[0]
     assert args[0] == "echo"
     assert env["WATCHER_OUTPUT_NAME"] == "DP-1"
     assert env["WATCHER_APP_PID"] == "4242"
+    assert env["WATCHER_APP_ID"] == "mygame"
+    assert env["WATCHER_APP_TITLE"] == "Level 1"
+    assert env["WATCHER_VRR"] == "on"
 
 
 def test_execute_hook_empty_spec_noop(monkeypatch):
@@ -529,17 +590,6 @@ def test_execute_hook_empty_spec_noop(monkeypatch):
     monkeypatch.setattr(nw, "_default_runner", fake)
     nw.execute_hook("", "DP-1")
     assert fake.calls == []
-
-
-# ===========================================================================
-# Self-check — a single runnable assertion that the bit-bug is fixed.
-# ===========================================================================
-
-
-def test_selfcheck_hyprland_fullscreen_bit():
-    for fs_state, expect in [(0, False), (1, False), (2, True), (3, True)]:
-        data = f'[{{"class":"x","pid":1,"size":[1,1],"workspace":{{"id":1}},"focusHistoryID":0,"fullscreen":{fs_state}}}]'
-        assert nw.parse_hyprland_windows(data)[0].fullscreen is expect
 
 
 if __name__ == "__main__":
