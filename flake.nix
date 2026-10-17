@@ -37,6 +37,15 @@
     desktopRows = lib.filter (m: m.role == "desktop") manifestRows;
     binRows = lib.filter (m: m.role != "unit" && m.role != "desktop") manifestRows;
 
+    # tests are dev-only: kept out of the build input, so no store path carries
+    # them, and a test listed in the manifest fails the cp instead of shipping.
+    # ponytail: match the test naming convention, not a manifest-derived list.
+    isTestFile = n: lib.hasSuffix ".bats" n || lib.hasPrefix "test-" n;
+    shippedSrc = lib.cleanSourceWith {
+      src = ./.;
+      filter = path: type: !isTestFile (baseNameOf path);
+    };
+
     # core package: every script on PATH (gpu-detect.sh included; it is
     # sourced, not exec'd), wl-watcher wrapped
     mkBerylUtils = pkgs:
@@ -44,9 +53,8 @@
         pname = "beryl-utils";
         version = "unstable";
 
-        # ponytail: copy the whole tree; the installPhase only grabs what it needs.
-        # a fileset filter is overkill for a repo this small.
-        src = ./.;
+        # tests never ship: shippedSrc is the tree minus the test files.
+        src = shippedSrc;
 
         # no compile step; we only arrange files
         dontBuild = true;
@@ -201,10 +209,11 @@
             pkgs.bats
             pkgs.shfmt
             pkgs.shellcheck
-            # ponytail: find, so new .sh files anywhere under assets/ are covered
-            (pkgs.writeShellScriptBin "localfmt" "exec shfmt -w -s -i 2 $(find assets -name '*.sh' -o -name '*.bats')")
-            (pkgs.writeShellScriptBin "locallint" "exec shellcheck $(find assets -name '*.sh' -o -name '*.bats')")
-            (pkgs.writeShellScriptBin "localbuild" "exec nix build .#default")
+            pkgs.just
+            # ponytail: recipes live in ./Justfile and its find globs set the file
+            # lists, so a new script or test is covered without touching this flake.
+            pkgs.python3
+            pkgs.python3Packages.pytest
           ];
         };
       };

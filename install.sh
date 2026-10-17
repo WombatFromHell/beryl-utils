@@ -9,18 +9,9 @@ GLOBAL_LINK_TARGET="/usr/local/bin"
 UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 
 # ponytail: manifest is the single source of truth, shared with flake.nix.
-# columns: src|role|outname|install_links|home_dest
-#   role: bin lib pybin unit desktop
-#   install_links: %localbin%/x,%globalbin%/x  (empty = copy only)
-#   home_dest: HOME-relative dir for role=desktop symlink target
+# Column format lives in assets/manifest; this script only dispatches on role.
 
 units=()
-
-check_dir() {
-  # ponytail: pure ensure-exists; mkdir -p returns 0 whether or not the dir
-  # pre-existed, so no caller needs to guard against a non-zero exit.
-  mkdir -p -- "$1"
-}
 
 dispatch() {
   local src="$1" role="$2" out="$3" links="$4" home="$5"
@@ -28,21 +19,21 @@ dispatch() {
   local file="$ASSETS_DIR/$src" dest="${src##*/}"
   case "$role" in
   unit)
-    check_dir "$UNIT_DIR"
+    mkdir -p -- "$UNIT_DIR"
     cp -vfp -- "$file" "$UNIT_DIR/$dest"
     units+=("$dest")
     ;;
   desktop)
-    check_dir "$PREFERRED_LINK_TARGET"
+    mkdir -p -- "$PREFERRED_LINK_TARGET"
     cp -vfp -- "$file" "$PREFERRED_LINK_TARGET/$dest"
-    check_dir "$HOME/$home"
+    mkdir -p -- "$HOME/$home"
     ln -sf "$PREFERRED_LINK_TARGET/$dest" "$HOME/$home/$out"
     ;;
   *)
-    check_dir "$PREFERRED_LINK_TARGET"
+    mkdir -p -- "$PREFERRED_LINK_TARGET"
     cp -vfp -- "$file" "$PREFERRED_LINK_TARGET/$dest"
     [[ -z $links ]] && return
-    check_dir "$LOCAL_LINK_TARGET"
+    mkdir -p -- "$LOCAL_LINK_TARGET"
     local IFS=',' link
     for link in $links; do
       link="${link//%localbin%/$LOCAL_LINK_TARGET}"
